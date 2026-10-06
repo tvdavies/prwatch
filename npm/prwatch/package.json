@@ -1,0 +1,25 @@
+{
+  "name": "prwatch",
+  "version": "0.0.0",
+  "description": "One shared GitHub PR poller per user, with a blocking wait command for agents and scripts.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tvdavies/prwatch.git"
+  },
+  "homepage": "https://github.com/tvdavies/prwatch#readme",
+  "bugs": "https://github.com/tvdavies/prwatch/issues",
+  "keywords": ["github", "pull-request", "ci", "agents", "rate-limit", "cli"],
+  "bin": {
+    "prwatch": "bin/prwatch"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": ["bin/prwatch", "install.js", "platforms.js"],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["linux", "darwin"],
+  "optionalDependencies": {}
+}
