@@ -187,3 +187,105 @@ func TestTruncatedThreads(t *testing.T) {
 		}
 	}
 }
+
+func TestPollNestedErrorMarksIncomplete(t *testing.T) {
+	// GitHub returned the PR but an error nulled commits: checks would
+	// otherwise decode as NONE, which counts as green and settled.
+	body := `{"data":{
+"p0":{"id":"PR_1","number":1,"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","commits":null},
+"p1":{"id":"PR_2","number":2,"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","commits":{"nodes":[]}},
+"rateLimit":{"cost":1,"limit":5000,"remaining":4000,"used":1000,"resetAt":"2026-10-06T13:00:00Z"}},
+"errors":[{"type":"INTERNAL","path":["p0","commits"],"message":"Something went wrong"}]}`
+	cl := serve(t, 200, nil, body)
+	res, _, err := cl.Poll(context.Background(), []Target{
+		{Ref: prref.Ref{Owner: "o", Repo: "r", Number: 1}, NodeID: "PR_1"},
+		{Ref: prref.Ref{Owner: "o", Repo: "r", Number: 2}, NodeID: "PR_2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := res[0].Snapshot
+	if res[0].Err != nil || s == nil || !s.Incomplete || !strings.Contains(s.IncompleteReason, "commits: Something went wrong") {
+		t.Fatalf("p0: err %v snapshot %+v", res[0].Err, s)
+	}
+	for _, r := range s.Reasons {
+		if r == "ready_auto_merge_off" {
+			t.Fatal("an incomplete PR was reported ready")
+		}
+	}
+	if res[1].Snapshot == nil || res[1].Snapshot.Incomplete {
+		t.Fatalf("p1 must not inherit p0's error: %+v", res[1].Snapshot)
+	}
+}
+
+func TestResolveNestedErrorDoesNotLeakToSiblings(t *testing.T) {
+	// q0 has a nested error; q1 is null with no error of its own and must be
+	// classified as not found, not as q0's error.
+	body := `{"data":{"r0":{
+"q0":{"id":"PR_1","number":1,"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","commits":null},
+"q1":null},
+"rateLimit":{"cost":1,"limit":5000,"remaining":4000,"used":1000,"resetAt":"2026-10-06T13:00:00Z"}},
+"errors":[{"type":"INTERNAL","path":["r0","q0","commits","nodes",0],"message":"Something went wrong"}]}`
+	cl := serve(t, 200, nil, body)
+	res, _, err := cl.Resolve(context.Background(), []prref.Ref{{Owner: "o", Repo: "r", Number: 1}, {Owner: "o", Repo: "r", Number: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		switch r.Ref.Number {
+		case 1:
+			if r.Snapshot == nil || !r.Snapshot.Incomplete || !strings.Contains(r.Snapshot.IncompleteReason, "commits.nodes.0: Something went wrong") {
+				t.Fatalf("q0: %+v", r.Snapshot)
+			}
+		case 2:
+			var nf *NotFoundError
+			if !errors.As(r.Err, &nf) {
+				t.Fatalf("q1: %T %v", r.Err, r.Err)
+			}
+		}
+	}
+}
+
+func TestNullPRWithNestedErrorIsNotNotFound(t *testing.T) {
+	// A failing non-null field nulls the whole PR but the error keeps the
+	// field's path. That is a failure to read the PR, not a missing PR.
+	rate := `"rateLimit":{"cost":1,"limit":5000,"remaining":4000,"used":1000,"resetAt":"2026-10-06T13:00:00Z"}`
+	cl := serve(t, 200, nil, `{"data":{"p0":null,"p1":null,`+rate+`},
+"errors":[{"type":"INTERNAL","path":["p0","mergeable"],"message":"Something went wrong"}]}`)
+	res, _, err := cl.Poll(context.Background(), []Target{
+		{Ref: prref.Ref{Owner: "o", Repo: "r", Number: 1}, NodeID: "PR_1"},
+		{Ref: prref.Ref{Owner: "o", Repo: "r", Number: 2}, NodeID: "PR_2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var te *TransientError
+	var nf *NotFoundError
+	if !errors.As(res[0].Err, &te) || !strings.Contains(res[0].Err.Error(), "mergeable") {
+		t.Fatalf("p0: %T %v", res[0].Err, res[0].Err)
+	}
+	if !errors.As(res[1].Err, &nf) {
+		t.Fatalf("p1 must not inherit p0's error: %T %v", res[1].Err, res[1].Err)
+	}
+
+	cl = serve(t, 200, nil, `{"data":{"r0":{"q0":null,"q1":null},`+rate+`},
+"errors":[{"type":"FORBIDDEN","path":["r0","q0","commits"],"message":"Resource not accessible by integration"},
+{"type":"NOT_FOUND","path":["r0","q1","headRepository"],"message":"Could not resolve"}]}`)
+	res, _, err = cl.Resolve(context.Background(), []prref.Ref{{Owner: "o", Repo: "r", Number: 1}, {Owner: "o", Repo: "r", Number: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		var ae *AuthError
+		switch r.Ref.Number {
+		case 1:
+			if !errors.As(r.Err, &ae) {
+				t.Fatalf("q0: %T %v", r.Err, r.Err)
+			}
+		case 2:
+			if !errors.As(r.Err, &te) {
+				t.Fatalf("q1: a nested NOT_FOUND is not a missing PR: %T %v", r.Err, r.Err)
+			}
+		}
+	}
+}

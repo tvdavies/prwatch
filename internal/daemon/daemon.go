@@ -136,9 +136,7 @@ func Run(cfg Config) error {
 	}
 	log.Info("daemon started", "pid", os.Getpid(), "version", cfg.Version, "socket", sock,
 		"idleGrace", cfg.IdleGrace, "fast", cfg.FastInterval, "slow", cfg.SlowInterval, "budgetShare", cfg.BudgetShare)
-	if until := gov.BackoffUntil(); until.After(time.Now()) {
-		log.Warn("honouring persisted back-off", "until", until.Format(time.RFC3339))
-	}
+	d.restoreRateState()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
@@ -163,6 +161,25 @@ func Run(cfg Config) error {
 	saveIDs(paths.IDs(cfg.StateDir), d.snapshotIDs())
 	log.Info("daemon exiting", "rounds", d.rounds, "requests", d.requests)
 	return nil
+}
+
+// restoreRateState applies the rate state loaded from rate.json, which an
+// earlier daemon or a direct status call wrote. Its back-off and low-budget
+// reserve are enforced by the governor; the time of the last recorded
+// request seeds lastRequest so the request gap also holds across restarts.
+func (d *Daemon) restoreRateState() {
+	now := time.Now()
+	st := d.gov.Snapshot()
+	if !st.UpdatedAt.IsZero() && !st.UpdatedAt.After(now) {
+		d.lastRequest = st.UpdatedAt
+	}
+	if st.BackoffUntil.After(now) {
+		d.log.Warn("honouring persisted back-off", "until", st.BackoffUntil.Format(time.RFC3339), "reason", st.BackoffReason)
+	}
+	if until := d.gov.ReserveUntil(); until.After(now) {
+		d.log.Warn("stored budget is below the reserve; waiting for the reset", "remaining", st.Remaining,
+			"until", until.Format(time.RFC3339))
+	}
 }
 
 func acquireLock(dir, sock string) (*os.File, bool) {
@@ -434,10 +451,7 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 		s.deliver(d.log, protocol.Message{Type: protocol.TypeError, Code: protocol.CodeAuth, Message: d.authErr})
 		return true
 	}
-	blockedUntil := d.gov.BackoffUntil()
-	if d.transientEnd.After(blockedUntil) {
-		blockedUntil = d.transientEnd
-	}
+	blockedUntil := d.blockedUntilLocked()
 	blocked := blockedUntil.After(now)
 	needKick := false
 	for _, ref := range refs {
@@ -552,11 +566,9 @@ func (d *Daemon) nextWakeLocked() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	d.interval = d.gov.Interval(d.baseIntervalLocked(active))
-	// Every request, scheduled or on demand, is spaced by at least the
-	// budget-derived gap, so new interest cannot outspend the budget share.
-	gap := max(d.cfg.MinGap, d.gov.Interval(0))
+	gap := d.requestGapLocked()
 	at := d.lastRound.Add(d.interval)
-	if g := d.lastRequest.Add(d.gov.Interval(0)); g.After(at) {
+	if g := d.lastRequest.Add(gap); g.After(at) {
 		at = g
 	}
 	for _, w := range active {
@@ -571,13 +583,40 @@ func (d *Daemon) nextWakeLocked() (time.Time, bool) {
 			break
 		}
 	}
-	if bo := d.gov.BackoffUntil(); bo.After(at) {
+	if bo := d.blockedUntilLocked(); bo.After(at) {
 		at = bo
 	}
-	if d.transientEnd.After(at) {
-		at = d.transientEnd
-	}
 	return at, true
+}
+
+// requestGapLocked is the minimum spacing between any two requests,
+// scheduled or on demand: never below the poll floor, and stretched by the
+// budget so new interest cannot outspend the budget share.
+func (d *Daemon) requestGapLocked() time.Duration {
+	return max(d.cfg.MinGap, d.cfg.MinInterval, d.gov.Interval(0))
+}
+
+// blockedUntilLocked returns the time before which no request may be sent:
+// a rate-limit back-off, a budget below the reserve, or a transient error
+// back-off, whichever ends last.
+func (d *Daemon) blockedUntilLocked() time.Time {
+	until := d.gov.BackoffUntil()
+	if r := d.gov.ReserveUntil(); r.After(until) {
+		until = r
+	}
+	if d.transientEnd.After(until) {
+		until = d.transientEnd
+	}
+	return until
+}
+
+// budgetBlocked reports whether the governor forbids a request now, through
+// a back-off or a budget below the reserve.
+func (d *Daemon) budgetBlocked() bool {
+	if blocked, _ := d.gov.Blocked(); blocked {
+		return true
+	}
+	return time.Now().Before(d.gov.ReserveUntil())
 }
 
 func (d *Daemon) pollLoop() {
@@ -629,7 +668,7 @@ func (d *Daemon) round() {
 	if len(unresolved) == 0 && len(targets) == 0 {
 		return
 	}
-	if blocked, _ := d.gov.Blocked(); blocked {
+	if d.budgetBlocked() {
 		return
 	}
 
@@ -638,11 +677,7 @@ func (d *Daemon) round() {
 	// Checked before every request: a response in this round may have
 	// exhausted the budget, or the daemon may be shutting down.
 	allowed := func() bool {
-		if ctx.Err() != nil {
-			return false
-		}
-		blocked, _ := d.gov.Blocked()
-		return !blocked
+		return ctx.Err() == nil && !d.budgetBlocked()
 	}
 	var (
 		results  []github.Result
@@ -828,6 +863,10 @@ func (d *Daemon) apply(results []github.Result) bool {
 		github.FillThreads(r.Snapshot, d.heads)
 		prev := w.snap
 		cur := r.Snapshot
+		if cur.Incomplete {
+			d.applyIncompleteLocked(w, cur)
+			continue
+		}
 		w.snap = cur
 		w.lastFetched = now
 		w.needsRefresh = false
@@ -855,6 +894,30 @@ func (d *Daemon) apply(results []github.Result) bool {
 		}
 	}
 	return idsChanged
+}
+
+// applyIncompleteLocked handles a PR that GitHub returned with part of its
+// data nulled by an error. The partial snapshot is never stored, never
+// compared and never sent to waiters or event streams, so it cannot satisfy
+// a condition or produce a change event. The previous good snapshot stays
+// in place and the next round fetches the PR again. One-shot status
+// requests still need an answer: they get the previous good snapshot, or
+// the partial one, flagged incomplete, when there is nothing better.
+func (d *Daemon) applyIncompleteLocked(w *watch, cur *snapshot.Snapshot) {
+	d.log.Warn("PR returned incomplete; keeping the previous snapshot", "pr", w.ref.String(),
+		"havePrevious", w.snap != nil, "reason", cur.IncompleteReason)
+	w.needsRefresh = false
+	reply := w.snap
+	if reply == nil {
+		reply = cur
+	}
+	for s := range w.subs {
+		if s.op != protocol.OpStatus || s.got[w.key] {
+			continue
+		}
+		s.got[w.key] = true
+		s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: reply, Changes: []string{"initial"}})
+	}
 }
 
 func (d *Daemon) snapshotIDs() map[string]string {

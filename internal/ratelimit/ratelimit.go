@@ -151,21 +151,46 @@ func (g *Governor) OnRateLimit(e *github.RateLimitError) time.Time {
 	return g.st.BackoffUntil
 }
 
+// allowedRoundsLocked returns how many more rounds Share of the remaining
+// budget pays for before the reset, or false when the budget is unknown or
+// the reset has passed.
+func (g *Governor) allowedRoundsLocked(now time.Time) (float64, bool) {
+	if g.st.Remaining < 0 || !g.st.ResetAt.After(now) {
+		return 0, false
+	}
+	// Remaining is -1 until a response reports it, so any other value is
+	// known, even if no successful response has reported the limit yet.
+	cost := g.st.RoundCost
+	if cost < 1 {
+		cost = 1
+	}
+	return g.Share * float64(g.st.Remaining) / float64(cost), true
+}
+
+// ReserveUntil returns the time before which no request may be sent because
+// the known budget is exhausted or below the reserve (Share of it does not
+// pay for one more round). It is zero when the budget allows a request. The
+// state comes from rate.json, so it also holds across daemon restarts.
+func (g *Governor) ReserveUntil() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if rounds, ok := g.allowedRoundsLocked(g.Now()); ok && rounds < 1 {
+		return g.st.ResetAt.Add(time.Second)
+	}
+	return time.Time{}
+}
+
 // Interval stretches base so that, at the last round cost, prwatch spends no
 // more than Share of the remaining budget before the reset.
 func (g *Governor) Interval(base time.Duration) time.Duration {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := g.Now()
-	if g.st.Remaining < 0 || g.st.Limit == 0 || !g.st.ResetAt.After(now) {
+	allowedRounds, ok := g.allowedRoundsLocked(now)
+	if !ok {
 		return base
 	}
 	untilReset := g.st.ResetAt.Sub(now)
-	cost := g.st.RoundCost
-	if cost < 1 {
-		cost = 1
-	}
-	allowedRounds := g.Share * float64(g.st.Remaining) / float64(cost)
 	if allowedRounds < 1 {
 		return untilReset + time.Second
 	}

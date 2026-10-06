@@ -217,3 +217,36 @@ func TestExcerpt(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+func TestIncompleteNeverSatisfiesConditions(t *testing.T) {
+	pending := mod(base(), func(s *Snapshot) {
+		s.Checks.State = "PENDING"
+		s.Checks.Contexts[0].Status = "IN_PROGRESS"
+		s.Checks.Contexts[0].Conclusion = ""
+	})
+	// The nested error nulled commits, so checks decode as NONE: green and
+	// settled if taken at face value.
+	partial := mod(pending, func(s *Snapshot) {
+		s.Checks = Checks{}
+		s.Incomplete, s.IncompleteReason = true, "commits: Something went wrong"
+	})
+	if Ready(partial) {
+		t.Fatal("an incomplete snapshot must never be ready")
+	}
+	for _, c := range []string{ForChange, ForChecks, ForReview, ForMergeable, ForMerged, ForClosed} {
+		w := &Waiter{For: c}
+		w.Met(pending)
+		if w.Met(partial) {
+			t.Errorf("--for %s met by an incomplete snapshot", c)
+		}
+		tok := ComputeToken(pending)
+		if (&Waiter{For: c, Since: &tok}).Met(partial) {
+			t.Errorf("--for %s --since met by an incomplete snapshot", c)
+		}
+	}
+	for _, r := range partial.Reasons {
+		if r == ReasonReadyAutoMergeOff {
+			t.Fatal("an incomplete snapshot must not be reported ready")
+		}
+	}
+}

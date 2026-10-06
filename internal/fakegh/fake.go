@@ -47,11 +47,12 @@ type Server struct {
 	remaining int
 	cost      int
 	nextID    int
+	nested    map[string]int // PR key -> responses left with commits nulled by an error
 }
 
 // New starts a fake server.
 func New() *Server {
-	s := &Server{prs: map[string]*github.RawPR{}, byID: map[string]string{}, heads: map[string]github.ThreadHead{}, limit: 1000000, remaining: 1000000, cost: 1}
+	s := &Server{prs: map[string]*github.RawPR{}, byID: map[string]string{}, heads: map[string]github.ThreadHead{}, nested: map[string]int{}, limit: 1000000, remaining: 1000000, cost: 1}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	return s
 }
@@ -107,6 +108,31 @@ func SetChecks(p *github.RawPR, state string) {
 	default:
 		c.Status, c.Conclusion = "COMPLETED", state
 	}
+}
+
+// FailCommits makes the next n responses that include the PR return it
+// with commits nulled and a GraphQL error beneath the PR's alias, as GitHub
+// does when a nested field fails.
+func (s *Server) FailCommits(key string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nested[strings.ToLower(key)] = n
+}
+
+// prData returns the response value for a PR at path, applying any nested
+// failure.
+func (s *Server) prData(key string, p *github.RawPR, path []any, errs *[]map[string]any) any {
+	if s.nested[key] <= 0 {
+		return p
+	}
+	s.nested[key]--
+	b, _ := json.Marshal(p)
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	m["commits"] = nil
+	*errs = append(*errs, map[string]any{"type": "INTERNAL", "path": append(path, "commits"),
+		"message": "Something went wrong while executing your query."})
+	return m
 }
 
 // SetThreadHead sets the first comment the fake returns for a thread.
@@ -256,7 +282,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if p := s.prs[key]; p != nil {
-					repo[m[1]] = p
+					repo[m[1]] = s.prData(key, p, []any{repoAlias, m[1]}, &errs)
 				} else {
 					repo[m[1]] = nil
 					errs = append(errs, map[string]any{"type": "NOT_FOUND", "path": []any{repoAlias, m[1]}, "message": "Could not resolve to a PullRequest"})
@@ -282,7 +308,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			key := s.byID[id]
 			prs = append(prs, key)
 			if p := s.prs[key]; p != nil {
-				data[m[1]] = p
+				data[m[1]] = s.prData(key, p, []any{m[1]}, &errs)
 			} else {
 				data[m[1]] = nil
 			}
