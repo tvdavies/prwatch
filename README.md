@@ -58,7 +58,7 @@ A `<pr>` can be:
 | --- | --- |
 | `change` (default) | any material field changes (see [Snapshot](#snapshot-json)) |
 | `checks` | the check rollup has left `PENDING`/`EXPECTED`. A head commit with no checks counts as settled. |
-| `review` | a new review, a reply in a review thread, or a thread is opened or resolved |
+| `review` | a new review, a reply in a review thread, a thread is opened or resolved, or a review or thread comment is [edited](#edits) |
 | `mergeable` | open and not a draft, approved (or no review required), checks green, no unresolved threads, and mergeable |
 | `merged` | the PR is merged |
 | `closed` | the PR is closed or merged |
@@ -66,6 +66,12 @@ A `<pr>` can be:
 `change` and `review` compare against the first snapshot `wait` sees. The others are level-triggered: if the condition already holds, `wait` returns at once.
 
 `--since TOKEN` makes `wait` report only a state that differs from `TOKEN`. If the PR has already moved on, `wait` returns straight away. `change` and `review` compare against the token rather than the first snapshot. This is how an agent loops without missing anything that happens between calls.
+
+Conflicts and base-branch moves are detected even when nothing on the PR itself changes, because `mergeable` and `mergeStateStatus` are part of the state (a PR that falls `BEHIND` a base requiring up-to-date branches wakes `change` too). GitHub computes mergeability lazily, so the first poll after the base moves may return `UNKNOWN`. That wakes `change` once; prwatch then polls again quickly, and the next state, `CONFLICTING` with the `conflict` reason for example, follows within seconds.
+
+### Edits
+
+Editing the PR description, an issue comment, a review body or a review-thread comment wakes `change` and appears in `events` as `description edited`, `comment edited` or `review edited`. Review and thread-comment edits also wake `review`. To keep each round cheap, only edits within the fetched window are seen: the newest 3 issue comments, the latest review from each reviewer, and the last 10 comments of each of the newest 5 review threads. Edits to older comments or threads are not seen.
 
 ### Exit codes
 
@@ -95,19 +101,21 @@ A `<pr>` can be:
   "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
   "autoMerge": { "enabled": false, "method": null },
   "reviewDecision": "APPROVED",
-  "reviews": [{ "author": "alice", "state": "APPROVED", "submittedAt": "…", "commit": "4b1c…" }],
+  "reviews": [{ "author": "alice", "state": "APPROVED", "submittedAt": "…", "commit": "4b1c…", "editedAt": null }],
   "reviewCount": 3,
   "reviewRequests": ["bob", "team:platform"],
   "threads": {
     "total": 4, "unresolved": 1,
-    "items": [{ "id": "PRRT_…", "path": "main.go", "line": 42, "outdated": false, "author": "alice", "excerpt": "Could this…" }]
+    "items": [{ "id": "PRRT_…", "path": "main.go", "line": 42, "outdated": false, "author": "alice", "excerpt": "Could this…" }],
+    "editedAt": "…"
   },
   "checks": {
     "state": "SUCCESS", "total": 6,
     "contexts": [{ "name": "test", "kind": "check_run", "status": "COMPLETED", "conclusion": "SUCCESS", "required": true }]
   },
-  "comments": { "total": 2, "recent": [{ "author": "bob", "createdAt": "…", "excerpt": "LGTM" }] },
+  "comments": { "total": 2, "recent": [{ "author": "bob", "createdAt": "…", "excerpt": "LGTM", "editedAt": null }] },
   "updatedAt": "…",
+  "bodyEditedAt": null,
   "needsAction": true,
   "reasons": ["unresolved_threads"],
   "token": "1.3fa9c1e2b7d04a11.9a1b2c3d",
@@ -123,6 +131,7 @@ The values come from GitHub's GraphQL API:
 - `reviewDecision` is null when no review policy applies.
 - `reviews` holds the latest review from each author.
 - `reviewCount` counts every review, including replies in threads.
+- `editedAt` and `bodyEditedAt` are GitHub's `lastEditedAt`, or null if never edited. `threads.editedAt` is the latest edit to a comment in the newest 5 threads; a thread item carries its own `editedAt` when it is one of them.
 
 `incomplete` is true when GitHub returned the PR but an error nulled part of it (its checks, for example). `incompleteReason` then says which field failed and why. An incomplete snapshot is never treated as authoritative:
 - it never satisfies a `--for` condition and is never `ready_auto_merge_off`;
@@ -141,8 +150,10 @@ The values come from GitHub's GraphQL API:
 | `ready_auto_merge_off` | approved, green, no unresolved threads and mergeable, but auto-merge is off |
 
 `token` is `1.<16 hex>.<8 hex>`:
-- the first hash covers every material field: state, draft, merge commit, head and base, title, mergeability, auto-merge, review decision, reviews, review requests, threads, checks and comment count;
-- the second covers reviews and threads only.
+- the first hash covers every material field: state, draft, merge commit, head and base, title, mergeability, auto-merge, review decision, reviews, review requests, threads, checks, comment count and [edits](#edits);
+- the second covers reviews and threads only, including review and thread-comment edits.
+
+A PR on which nothing has been edited keeps the same token as in 0.1.0.
 
 `updatedAt`, `fetchedAt` and excerpts are not material.
 
@@ -154,7 +165,8 @@ The values come from GitHub's GraphQL API:
 - **Polling:** the daemon polls the union of PRs that open connections care about. It never sends requests concurrently:
   - The first time it sees a PR, one aliased query resolves `owner/repo#n` to a node id and returns the full snapshot. Ids are cached in `ids.json`.
   - After that, each round is one aliased `node(id:)` query for up to 50 PRs, plus `rateLimit { cost remaining resetAt }`.
-  - The first comment of each new unresolved review thread costs one small extra request, made only when such threads appear. The result is cached.
+  - The first comment of each new unresolved review thread costs one small extra request, made only when such threads appear. The result is cached, and fetched again after an edit in the thread.
+  - A round of up to 10 PRs costs 1 point. The edit window adds a small nested connection, so bigger rounds cost a little more (about 3 points for 20 PRs, 7 for 50).
 - **Exit:** with no waiters left, the daemon exits after an idle grace period (30s by default) and removes the socket.
 
 ## Rate limits

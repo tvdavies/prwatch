@@ -1008,3 +1008,205 @@ func TestDirectStatusReportsIncomplete(t *testing.T) {
 		t.Fatalf("snapshot: incomplete %v reason %q", s.Incomplete, s.IncompleteReason)
 	}
 }
+
+// waitPolls waits until the fake has served n more poll requests.
+func (e *env) waitPolls(n int) {
+	e.t.Helper()
+	count := func() int {
+		c := 0
+		for _, r := range e.fake.Requests() {
+			if r.Kind == "poll" {
+				c++
+			}
+		}
+		return c
+	}
+	target := count() + n
+	eventually(e.t, 10*time.Second, fmt.Sprintf("%d more polls", n), func() bool { return count() >= target })
+}
+
+func TestEditsWakeWaiters(t *testing.T) {
+	e := newEnv(t)
+	k := e.fake.AddPR("o", "r", 1)
+	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	e.fake.Update(k, func(p *github.RawPR) {
+		p.Comments.TotalCount = 1
+		p.Comments.Nodes = []github.RawComment{{Author: &github.Actor{Login: "bob"}, CreatedAt: created, BodyText: "LGTM"}}
+		p.Reviews.TotalCount = 1
+		p.LatestReviews.Nodes = []github.RawReview{{Author: &github.Actor{Login: "alice"}, State: "COMMENTED", SubmittedAt: &created}}
+		line := 3
+		p.ReviewThreads.TotalCount = 1
+		p.ReviewThreads.Nodes = []github.RawThread{{ID: "T1", Path: "main.go", Line: &line}}
+		p.RecentThreads.Nodes = []github.RawRecentThread{{ID: "T1"}}
+		p.RecentThreads.Nodes[0].Comments.Nodes = []github.RawEdit{{}}
+	})
+	e.fake.SetThreadHead("T1", "alice", "Rename this")
+	ev := e.start("events", "--pr", "o/r#1", "--json")
+	change := e.start("wait", "o/r#1", "--for", "change", "--json")
+	review := e.start("wait", "o/r#1", "--for", "review", "--json")
+	e.waitWatched(1, 3)
+
+	// Polls that find nothing new wake nobody.
+	e.waitPolls(3)
+	if !change.running() || !review.running() {
+		t.Fatalf("a no-op poll woke a waiter: change %q review %q", change.out.String(), review.out.String())
+	}
+	if n := strings.Count(ev.out.String(), "\n"); n != 1 {
+		t.Fatalf("no-op polls emitted events:\n%s", ev.out.String())
+	}
+
+	// Editing an issue comment wakes --for change but not --for review.
+	edited := time.Now().UTC()
+	e.fake.Update(k, func(p *github.RawPR) {
+		p.Comments.Nodes[0].BodyText = "LGTM, with one nit"
+		p.Comments.Nodes[0].LastEditedAt = &edited
+	})
+	r := change.wait(t, 5*time.Second)
+	if r.code != 0 {
+		t.Fatalf("--for change: exit %d: %s", r.code, r.stderr)
+	}
+	if s := parseSnap(t, r.stdout); s.Comments.Total != 1 || s.Comments.Recent[0].EditedAt == nil {
+		t.Fatalf("snapshot comments: %+v", s.Comments)
+	}
+	eventually(t, 5*time.Second, "comment edited event", func() bool {
+		return strings.Contains(ev.out.String(), `"changes":["comment edited"]`)
+	})
+	e.waitPolls(2)
+	if !review.running() {
+		t.Fatalf("--for review woke on a comment edit: %s", review.out.String())
+	}
+
+	// Editing a review body wakes --for review.
+	e.fake.Update(k, func(p *github.RawPR) {
+		at := time.Now().UTC()
+		p.LatestReviews.Nodes[0].LastEditedAt = &at
+	})
+	if r := review.wait(t, 5*time.Second); r.code != 0 {
+		t.Fatalf("--for review on review edit: exit %d: %s", r.code, r.stderr)
+	}
+	eventually(t, 5*time.Second, "review edited event", func() bool {
+		return strings.Contains(ev.out.String(), `"changes":["review edited"]`)
+	})
+
+	// Editing a review-thread comment wakes --for review, and the thread's
+	// cached excerpt is refetched.
+	review = e.start("wait", "o/r#1", "--for", "review", "--json")
+	e.waitWatched(1, 2)
+	e.fake.SetThreadHead("T1", "alice", "Rename this, please")
+	e.fake.Update(k, func(p *github.RawPR) {
+		at := time.Now().UTC()
+		p.RecentThreads.Nodes[0].Comments.Nodes[0].LastEditedAt = &at
+	})
+	r = review.wait(t, 5*time.Second)
+	if r.code != 0 {
+		t.Fatalf("--for review on thread edit: exit %d: %s", r.code, r.stderr)
+	}
+	s := parseSnap(t, r.stdout)
+	if s.Threads.EditedAt == nil || s.Threads.Items[0].Excerpt != "Rename this, please" {
+		t.Fatalf("threads after edit: %+v", s.Threads)
+	}
+	if n := strings.Count(ev.out.String(), `"changes":["review edited"]`); n != 2 {
+		t.Fatalf("want two review edited events:\n%s", ev.out.String())
+	}
+}
+
+// A conflict caused by the base branch moving is seen even though nothing
+// on the PR changes: GitHub first reports mergeability as UNKNOWN while it
+// recomputes, then CONFLICTING.
+func TestBaseMoveConflictDetected(t *testing.T) {
+	e := newEnv(t, "PRWATCH_POLL_SLOW=2s", "PRWATCH_POLL_FAST=200ms")
+	k := e.fake.AddPR("o", "r", 1)
+	st := e.run("status", "o/r#1", "--json")
+	var snaps []snapshot.Snapshot
+	if err := json.Unmarshal([]byte(st.stdout), &snaps); err != nil || len(snaps) != 1 {
+		t.Fatalf("status %q: %v", st.stdout, err)
+	}
+	tok := snaps[0].Token
+	head := snaps[0].HeadRefOid
+
+	ev := e.start("events", "--pr", "o/r#1", "--json")
+	change := e.start("wait", "o/r#1", "--for", "change", "--json")
+	mergeable := e.start("wait", "o/r#1", "--for", "mergeable", "--since", tok, "--json")
+	e.waitWatched(1, 3)
+	e.waitPolls(1) // settle into the slow cadence
+
+	e.fake.OnPoll(k,
+		func(p *github.RawPR) { p.Mergeable, p.MergeStateStatus = "UNKNOWN", "UNKNOWN" },
+		func(p *github.RawPR) { p.Mergeable, p.MergeStateStatus = "CONFLICTING", "DIRTY" },
+	)
+	r := change.wait(t, 5*time.Second)
+	if r.code != 0 {
+		t.Fatalf("--for change: exit %d: %s", r.code, r.stderr)
+	}
+	first := parseSnap(t, r.stdout)
+	if first.Mergeable != "UNKNOWN" || first.HeadRefOid != head {
+		t.Fatalf("first wake: mergeable %s head %s", first.Mergeable, first.HeadRefOid)
+	}
+
+	// The agent waits again from the token it was given and sees the conflict.
+	r = e.run("wait", "o/r#1", "--for", "change", "--since", first.Token, "--json", "--timeout", "5s")
+	if r.code != 0 {
+		t.Fatalf("--since wait: exit %d: %s", r.code, r.stderr)
+	}
+	s := parseSnap(t, r.stdout)
+	if s.Mergeable != "CONFLICTING" || !s.NeedsAction || !slicesContain(s.Reasons, snapshot.ReasonConflict) || s.HeadRefOid != head {
+		t.Fatalf("conflict snapshot: mergeable %s needsAction %v reasons %v head %s", s.Mergeable, s.NeedsAction, s.Reasons, s.HeadRefOid)
+	}
+
+	// UNKNOWN switches to the fast interval: the CONFLICTING poll follows
+	// the UNKNOWN one far sooner than the 2s slow interval.
+	steps := e.fake.StepTimes(k)
+	if len(steps) != 2 {
+		t.Fatalf("steps served: %d", len(steps))
+	}
+	var before time.Time
+	for _, req := range e.fake.Requests() {
+		if (req.Kind == "poll" || req.Kind == "threads") && req.At.Before(steps[0]) {
+			before = req.At
+		}
+	}
+	slowGap, fastGap := steps[0].Sub(before), steps[1].Sub(steps[0])
+	t.Logf("gap before UNKNOWN %s, UNKNOWN to CONFLICTING %s", slowGap, fastGap)
+	if slowGap < 1500*time.Millisecond || fastGap > time.Second {
+		t.Fatalf("interval not shortened: before %s, after UNKNOWN %s", slowGap, fastGap)
+	}
+
+	eventually(t, 5*time.Second, "mergeable events", func() bool {
+		out := ev.out.String()
+		return strings.Contains(out, "mergeable UNKNOWN/UNKNOWN") && strings.Contains(out, "mergeable CONFLICTING/DIRTY")
+	})
+	if !mergeable.running() {
+		t.Fatalf("--for mergeable fired on a conflict: %s", mergeable.out.String())
+	}
+}
+
+func slicesContain(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// When the base branch requires PRs to be up to date, a base move makes the
+// PR BEHIND without any change to the PR itself.
+func TestBaseMoveBehindWakesChange(t *testing.T) {
+	e := newEnv(t)
+	k := e.fake.AddPR("o", "r", 1)
+	change := e.start("wait", "o/r#1", "--for", "change", "--json")
+	e.waitWatched(1, 1)
+	e.waitPolls(1)
+	if !change.running() {
+		t.Fatalf("woke before the base moved: %s", change.out.String())
+	}
+	e.fake.OnPoll(k, func(p *github.RawPR) { p.MergeStateStatus = "BEHIND" })
+	r := change.wait(t, 5*time.Second)
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	s := parseSnap(t, r.stdout)
+	if s.MergeStateStatus != "BEHIND" || s.Mergeable != "MERGEABLE" || slicesContain(s.Reasons, snapshot.ReasonReadyAutoMergeOff) {
+		t.Fatalf("snapshot: %s/%s reasons %v", s.Mergeable, s.MergeStateStatus, s.Reasons)
+	}
+}

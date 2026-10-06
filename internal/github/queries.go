@@ -18,20 +18,27 @@ const ChunkSize = 50
 
 // prFragment selects everything except the status check rollup, which needs
 // a per-PR argument for isRequired. Nested connections are avoided because
-// GitHub's cost model multiplies them per parent node.
-const prFragment = `fragment PRF on PullRequest {
+// GitHub's cost model multiplies them per parent node; the one exception is
+// recentThreads, kept to a few threads so a round of up to about ten PRs
+// still costs one point. Edits are seen only within the fetched window: the
+// description, the newest 3 issue comments, the latest review per reviewer
+// and the last 10 comments of each of the newest few review threads.
+var prFragment = `fragment PRF on PullRequest {
   id number url title state isDraft merged mergedAt
   mergeCommit { oid }
   headRefOid baseRefName mergeable mergeStateStatus
   autoMergeRequest { enabledAt mergeMethod }
-  reviewDecision updatedAt
+  reviewDecision updatedAt lastEditedAt
   repository { nameWithOwner }
-  latestReviews(first: 20) { nodes { author { login } state submittedAt commit { oid } } }
+  latestReviews(first: 20) { nodes { author { login } state submittedAt lastEditedAt commit { oid } } }
   reviews(first: 0) { totalCount }
   reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } ... on Mannequin { login } ... on Team { slug } } } }
   reviewThreads(last: 100) { totalCount nodes { id isResolved isOutdated path line originalLine } }
-  comments(last: 3) { totalCount nodes { author { login } createdAt bodyText } }
+  recentThreads: reviewThreads(last: ` + recentThreadWindow + `) { nodes { id comments(last: 10) { nodes { lastEditedAt } } } }
+  comments(last: 3) { totalCount nodes { author { login } createdAt lastEditedAt bodyText } }
 }`
+
+var recentThreadWindow = strconv.Itoa(snapshot.RecentThreadWindow)
 
 const rateLimitSel = `rateLimit { cost limit remaining used resetAt }`
 
@@ -199,6 +206,9 @@ func (c *Client) Poll(ctx context.Context, targets []Target) ([]Result, RateInfo
 type ThreadHead struct {
 	Author  string
 	Excerpt string
+	// Edited is the thread's edit stamp when the head was fetched, so a
+	// cached head is refetched after an edit in the thread.
+	Edited string
 }
 
 // ThreadHeads fetches the first comment of each given review thread.
@@ -234,17 +244,38 @@ func (c *Client) ThreadHeads(ctx context.Context, ids []string) (map[string]Thre
 	return out, resp.Rate, nil
 }
 
-// MissingThreads returns unresolved thread ids in snaps not present in heads.
+// MissingThreads returns unresolved thread ids in snaps not present in
+// heads, or whose thread has been edited since the head was fetched.
 func MissingThreads(snaps []*snapshot.Snapshot, heads map[string]ThreadHead) []string {
 	var ids []string
 	for _, s := range snaps {
 		for _, t := range s.Threads.Items {
-			if _, ok := heads[t.ID]; !ok {
+			if h, ok := heads[t.ID]; !ok || h.Edited != editStamp(t.EditedAt) {
 				ids = append(ids, t.ID)
 			}
 		}
 	}
 	return ids
+}
+
+// StampHeads records each thread's current edit stamp on freshly fetched
+// heads.
+func StampHeads(snaps []*snapshot.Snapshot, heads map[string]ThreadHead) {
+	for _, s := range snaps {
+		for _, t := range s.Threads.Items {
+			if h, ok := heads[t.ID]; ok {
+				h.Edited = editStamp(t.EditedAt)
+				heads[t.ID] = h
+			}
+		}
+	}
+}
+
+func editStamp(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // FillThreads copies thread authors and excerpts from heads into s.
@@ -392,6 +423,7 @@ type RawPR struct {
 	AutoMergeRequest *RawAutoMerge `json:"autoMergeRequest"`
 	ReviewDecision   *string       `json:"reviewDecision"`
 	UpdatedAt        time.Time     `json:"updatedAt"`
+	LastEditedAt     *time.Time    `json:"lastEditedAt"`
 	Repository       struct {
 		NameWithOwner string `json:"nameWithOwner"`
 	} `json:"repository"`
@@ -408,6 +440,9 @@ type RawPR struct {
 		TotalCount int         `json:"totalCount"`
 		Nodes      []RawThread `json:"nodes"`
 	} `json:"reviewThreads"`
+	RecentThreads struct {
+		Nodes []RawRecentThread `json:"nodes"`
+	} `json:"recentThreads"`
 	Comments struct {
 		TotalCount int          `json:"totalCount"`
 		Nodes      []RawComment `json:"nodes"`
@@ -442,10 +477,11 @@ type RawCommitNode struct {
 
 // RawReview is a latestReviews node.
 type RawReview struct {
-	Author      *Actor     `json:"author"`
-	State       string     `json:"state"`
-	SubmittedAt *time.Time `json:"submittedAt"`
-	Commit      *OID       `json:"commit"`
+	Author       *Actor     `json:"author"`
+	State        string     `json:"state"`
+	SubmittedAt  *time.Time `json:"submittedAt"`
+	LastEditedAt *time.Time `json:"lastEditedAt"`
+	Commit       *OID       `json:"commit"`
 }
 
 // RawThread is a reviewThreads node.
@@ -458,11 +494,26 @@ type RawThread struct {
 	OriginalLine *int   `json:"originalLine"`
 }
 
+// RawRecentThread is a recentThreads node: one of the newest review
+// threads with the edit times of its last comments.
+type RawRecentThread struct {
+	ID       string `json:"id"`
+	Comments struct {
+		Nodes []RawEdit `json:"nodes"`
+	} `json:"comments"`
+}
+
+// RawEdit carries a comment's lastEditedAt.
+type RawEdit struct {
+	LastEditedAt *time.Time `json:"lastEditedAt"`
+}
+
 // RawComment is a comments node.
 type RawComment struct {
-	Author    *Actor    `json:"author"`
-	CreatedAt time.Time `json:"createdAt"`
-	BodyText  string    `json:"bodyText"`
+	Author       *Actor     `json:"author"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	LastEditedAt *time.Time `json:"lastEditedAt"`
+	BodyText     string     `json:"bodyText"`
 }
 
 // RawRollup is a statusCheckRollup.
@@ -517,6 +568,7 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 		ReviewDecision:   p.ReviewDecision,
 		ReviewCount:      p.Reviews.TotalCount,
 		UpdatedAt:        p.UpdatedAt,
+		BodyEditedAt:     p.LastEditedAt,
 		FetchedAt:        now.UTC(),
 	}
 	if p.Number == 0 {
@@ -534,7 +586,7 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 		}
 	}
 	for _, r := range p.LatestReviews.Nodes {
-		rv := snapshot.Review{Author: r.Author.name(), State: r.State, SubmittedAt: r.SubmittedAt}
+		rv := snapshot.Review{Author: r.Author.name(), State: r.State, SubmittedAt: r.SubmittedAt, EditedAt: r.LastEditedAt}
 		if r.Commit != nil {
 			c := r.Commit.Oid
 			rv.Commit = &c
@@ -552,6 +604,22 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 		}
 	}
 	s.Threads.Total = p.ReviewThreads.TotalCount
+	threadEdits := map[string]*time.Time{}
+	for _, t := range p.RecentThreads.Nodes {
+		var last *time.Time
+		for _, c := range t.Comments.Nodes {
+			if c.LastEditedAt != nil && (last == nil || c.LastEditedAt.After(*last)) {
+				last = c.LastEditedAt
+			}
+		}
+		if last == nil {
+			continue
+		}
+		threadEdits[t.ID] = last
+		if s.Threads.EditedAt == nil || last.After(*s.Threads.EditedAt) {
+			s.Threads.EditedAt = last
+		}
+	}
 	for _, t := range p.ReviewThreads.Nodes {
 		if t.IsResolved {
 			continue
@@ -560,7 +628,7 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 		if line == nil {
 			line = t.OriginalLine
 		}
-		s.Threads.Items = append(s.Threads.Items, snapshot.Thread{ID: t.ID, Path: t.Path, Line: line, Outdated: t.IsOutdated})
+		s.Threads.Items = append(s.Threads.Items, snapshot.Thread{ID: t.ID, Path: t.Path, Line: line, Outdated: t.IsOutdated, EditedAt: threadEdits[t.ID]})
 	}
 	s.Threads.Unresolved = len(s.Threads.Items)
 	// Only the most recent 100 threads are fetched; older ones may hide
@@ -568,7 +636,7 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 	s.Threads.Truncated = p.ReviewThreads.TotalCount > len(p.ReviewThreads.Nodes)
 	s.Comments.Total = p.Comments.TotalCount
 	for _, c := range p.Comments.Nodes {
-		s.Comments.Recent = append(s.Comments.Recent, snapshot.Comment{Author: c.Author.name(), CreatedAt: c.CreatedAt, Excerpt: snapshot.Excerpt(c.BodyText, 160)})
+		s.Comments.Recent = append(s.Comments.Recent, snapshot.Comment{Author: c.Author.name(), CreatedAt: c.CreatedAt, EditedAt: c.LastEditedAt, Excerpt: snapshot.Excerpt(c.BodyText, 160)})
 	}
 	if len(p.Commits.Nodes) > 0 {
 		if r := p.Commits.Nodes[0].Commit.StatusCheckRollup; r != nil {

@@ -42,10 +42,12 @@ type Snapshot struct {
 	Checks           Checks     `json:"checks"`
 	Comments         Comments   `json:"comments"`
 	UpdatedAt        time.Time  `json:"updatedAt"`
-	NeedsAction      bool       `json:"needsAction"`
-	Reasons          []string   `json:"reasons"`
-	Token            string     `json:"token"`
-	FetchedAt        time.Time  `json:"fetchedAt"`
+	// BodyEditedAt is when the PR description was last edited, or null.
+	BodyEditedAt *time.Time `json:"bodyEditedAt"`
+	NeedsAction  bool       `json:"needsAction"`
+	Reasons      []string   `json:"reasons"`
+	Token        string     `json:"token"`
+	FetchedAt    time.Time  `json:"fetchedAt"`
 	// Incomplete is true when GitHub returned the PR but an error nulled
 	// part of it, so some fields (checks, for example) may be missing.
 	// An incomplete snapshot never satisfies a wait condition.
@@ -65,7 +67,13 @@ type Review struct {
 	State       string     `json:"state"`
 	SubmittedAt *time.Time `json:"submittedAt"`
 	Commit      *string    `json:"commit"`
+	// EditedAt is when the review body was last edited, or null.
+	EditedAt *time.Time `json:"editedAt"`
 }
+
+// RecentThreadWindow is how many of the newest review threads are checked
+// for comment edits. Edits in older threads are not seen.
+const RecentThreadWindow = 5
 
 // Threads summarises review threads.
 type Threads struct {
@@ -75,6 +83,9 @@ type Threads struct {
 	// (100), so Unresolved may be an undercount.
 	Truncated bool     `json:"truncated"`
 	Items     []Thread `json:"items"`
+	// EditedAt is the latest edit to a comment in the newest
+	// RecentThreadWindow threads (their last 10 comments each), or null.
+	EditedAt *time.Time `json:"editedAt"`
 }
 
 // Thread is one unresolved review thread.
@@ -85,6 +96,9 @@ type Thread struct {
 	Outdated bool   `json:"outdated"`
 	Author   string `json:"author"`
 	Excerpt  string `json:"excerpt"`
+	// EditedAt is the latest edit to a comment in this thread, when the
+	// thread is among the newest RecentThreadWindow threads; otherwise null.
+	EditedAt *time.Time `json:"editedAt,omitempty"`
 }
 
 // Checks summarises the head commit's status check rollup.
@@ -120,6 +134,8 @@ type Comment struct {
 	Author    string    `json:"author"`
 	CreatedAt time.Time `json:"createdAt"`
 	Excerpt   string    `json:"excerpt"`
+	// EditedAt is when the comment was last edited, or null.
+	EditedAt *time.Time `json:"editedAt"`
 }
 
 // Reasons reported in needsAction.
@@ -257,12 +273,15 @@ func isHex(s string) bool {
 	return err == nil
 }
 
+// Edit fields are omitted when empty so that a PR nothing has been edited
+// on keeps the token it had before edits were tracked.
 type reviewMaterial struct {
-	Decision *string  `json:"d"`
-	Reviews  []string `json:"r"`
-	Count    int      `json:"c"`
-	Total    int      `json:"t"`
-	Open     []string `json:"o"`
+	Decision   *string  `json:"d"`
+	Reviews    []string `json:"r"`
+	Count      int      `json:"c"`
+	Total      int      `json:"t"`
+	Open       []string `json:"o"`
+	ThreadEdit string   `json:"te,omitempty"`
 }
 
 type allMaterial struct {
@@ -284,11 +303,15 @@ type allMaterial struct {
 	LastComment string   `json:"lc"`
 	Review      string   `json:"rv"`
 	Incomplete  bool     `json:"inc,omitempty"`
+	BodyEdit    string   `json:"be,omitempty"`
+	CommentEdit []string `json:"ce,omitempty"`
 }
 
-// ComputeToken hashes the material fields of s.
+// ComputeToken hashes the material fields of s. Edits count only within
+// the fetched window: the PR description, the newest issue comments, the
+// latest review per reviewer and the newest RecentThreadWindow threads.
 func ComputeToken(s *Snapshot) Token {
-	rm := reviewMaterial{Decision: s.ReviewDecision, Count: s.ReviewCount, Total: s.Threads.Total}
+	rm := reviewMaterial{Decision: s.ReviewDecision, Count: s.ReviewCount, Total: s.Threads.Total, ThreadEdit: stamp(s.Threads.EditedAt)}
 	for _, r := range s.Reviews {
 		var at, commit string
 		if r.SubmittedAt != nil {
@@ -297,7 +320,11 @@ func ComputeToken(s *Snapshot) Token {
 		if r.Commit != nil {
 			commit = *r.Commit
 		}
-		rm.Reviews = append(rm.Reviews, r.Author+"|"+r.State+"|"+at+"|"+commit)
+		m := r.Author + "|" + r.State + "|" + at + "|" + commit
+		if r.EditedAt != nil {
+			m += "|e" + stamp(r.EditedAt)
+		}
+		rm.Reviews = append(rm.Reviews, m)
 	}
 	sort.Strings(rm.Reviews)
 	for _, t := range s.Threads.Items {
@@ -312,8 +339,14 @@ func ComputeToken(s *Snapshot) Token {
 		Mergeable: s.Mergeable, MergeState: s.MergeStateStatus,
 		AutoMerge: s.AutoMerge.Enabled, AutoMethod: s.AutoMerge.Method,
 		Checks: s.Checks.State, Comments: s.Comments.Total, Review: review,
-		Incomplete: s.Incomplete,
+		Incomplete: s.Incomplete, BodyEdit: stamp(s.BodyEditedAt),
 	}
+	for _, c := range s.Comments.Recent {
+		if c.EditedAt != nil {
+			am.CommentEdit = append(am.CommentEdit, c.Author+"|"+c.CreatedAt.UTC().Format(time.RFC3339)+"|"+stamp(c.EditedAt))
+		}
+	}
+	sort.Strings(am.CommentEdit)
 	am.Requests = append(am.Requests, s.ReviewRequests...)
 	sort.Strings(am.Requests)
 	for _, c := range s.Checks.Contexts {
@@ -325,6 +358,14 @@ func ComputeToken(s *Snapshot) Token {
 		am.LastComment = last.Author + "|" + last.CreatedAt.UTC().Format(time.RFC3339)
 	}
 	return Token{All: hashOf(am)[:16], Review: review}
+}
+
+// stamp formats an optional time for hashing; nil yields "".
+func stamp(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 func hashOf(v any) string {
@@ -451,10 +492,52 @@ func Changes(prev, cur *Snapshot) []string {
 	if strings.Join(prev.ReviewRequests, ",") != strings.Join(cur.ReviewRequests, ",") {
 		out = append(out, "review requests")
 	}
+	if stamp(prev.BodyEditedAt) != stamp(cur.BodyEditedAt) && cur.BodyEditedAt != nil {
+		out = append(out, "description edited")
+	}
+	if commentEdited(prev, cur) {
+		out = append(out, "comment edited")
+	}
+	if reviewEdited(prev, cur) {
+		out = append(out, "review edited")
+	}
 	if len(out) == 0 {
 		out = append(out, "updated")
 	}
 	return out
+}
+
+// commentEdited reports whether a recent issue comment present in both
+// snapshots has a newer edit.
+func commentEdited(prev, cur *Snapshot) bool {
+	seen := map[string]string{}
+	for _, c := range prev.Comments.Recent {
+		seen[c.Author+"|"+c.CreatedAt.UTC().Format(time.RFC3339Nano)] = stamp(c.EditedAt)
+	}
+	for _, c := range cur.Comments.Recent {
+		if was, ok := seen[c.Author+"|"+c.CreatedAt.UTC().Format(time.RFC3339Nano)]; ok && c.EditedAt != nil && was != stamp(c.EditedAt) {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewEdited reports whether a review body (same author and submission)
+// or a comment in a recent review thread has a newer edit.
+func reviewEdited(prev, cur *Snapshot) bool {
+	if c := cur.Threads.EditedAt; c != nil && (prev.Threads.EditedAt == nil || c.After(*prev.Threads.EditedAt)) {
+		return true
+	}
+	seen := map[string]string{}
+	for _, r := range prev.Reviews {
+		seen[r.Author+"|"+stamp(r.SubmittedAt)] = stamp(r.EditedAt)
+	}
+	for _, r := range cur.Reviews {
+		if was, ok := seen[r.Author+"|"+stamp(r.SubmittedAt)]; ok && r.EditedAt != nil && was != stamp(r.EditedAt) {
+			return true
+		}
+	}
+	return false
 }
 
 func contextKeys(s *Snapshot) []string {

@@ -48,11 +48,14 @@ type Server struct {
 	cost      int
 	nextID    int
 	nested    map[string]int // PR key -> responses left with commits nulled by an error
+	steps     map[string][]func(p *github.RawPR)
+	stepAt    map[string][]time.Time
+	reqAt     time.Time // when the request being served arrived
 }
 
 // New starts a fake server.
 func New() *Server {
-	s := &Server{prs: map[string]*github.RawPR{}, byID: map[string]string{}, heads: map[string]github.ThreadHead{}, nested: map[string]int{}, limit: 1000000, remaining: 1000000, cost: 1}
+	s := &Server{prs: map[string]*github.RawPR{}, byID: map[string]string{}, heads: map[string]github.ThreadHead{}, nested: map[string]int{}, steps: map[string][]func(*github.RawPR){}, stepAt: map[string][]time.Time{}, limit: 1000000, remaining: 1000000, cost: 1}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	return s
 }
@@ -119,9 +122,32 @@ func (s *Server) FailCommits(key string, n int) {
 	s.nested[strings.ToLower(key)] = n
 }
 
-// prData returns the response value for a PR at path, applying any nested
-// failure.
+// OnPoll queues mutations applied one per response that includes the PR,
+// before it is served, to model state GitHub changes between polls without
+// the PR itself being updated (UpdatedAt is left alone).
+func (s *Server) OnPoll(key string, steps ...func(p *github.RawPR)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := strings.ToLower(key)
+	s.steps[k] = append(s.steps[k], steps...)
+}
+
+// StepTimes returns when each request that served an OnPoll step for the
+// PR arrived; these match the At of its entry in Requests.
+func (s *Server) StepTimes(key string) []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.stepAt[strings.ToLower(key)]...)
+}
+
+// prData returns the response value for a PR at path, applying any queued
+// OnPoll step and any nested failure.
 func (s *Server) prData(key string, p *github.RawPR, path []any, errs *[]map[string]any) any {
+	if st := s.steps[key]; len(st) > 0 {
+		st[0](p)
+		s.steps[key] = st[1:]
+		s.stepAt[key] = append(s.stepAt[key], s.reqAt)
+	}
 	if s.nested[key] <= 0 {
 		return p
 	}
@@ -211,6 +237,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	s.reqAt = now
 	kind := "poll"
 	switch {
 	case strings.Contains(body.Query, "nodes(ids: $ids)"):

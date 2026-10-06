@@ -742,6 +742,7 @@ func (d *Daemon) round() {
 			}
 			d.gov.Observe(rate)
 			cost += rate.Cost
+			github.StampHeads(snaps, heads)
 			d.mu.Lock()
 			for k, v := range heads {
 				d.heads[k] = v
