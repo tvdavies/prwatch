@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+"use strict";
+
+// Fallback launcher. On supported platforms the postinstall script replaces
+// this file with the native binary, so `prwatch` runs without Node at all.
+// This file only runs when install scripts were skipped (--ignore-scripts)
+// or under Yarn. Even then it replaces itself with the binary via
+// process.execve where Node supports it, so no Node process stays alive
+// while `prwatch wait` blocks.
+
+const platforms = require("../platforms.js");
+
+const key = `${process.platform} ${process.arch}`;
+const pkg = platforms[key];
+if (!pkg) {
+  console.error(`prwatch: no prebuilt binary for ${key}. Supported: ${Object.keys(platforms).join(", ")}.`);
+  process.exit(1);
+}
+
+let bin;
+try {
+  bin = require.resolve(`${pkg}/bin/prwatch`);
+} catch {
+  console.error(
+    `prwatch: the optional dependency ${pkg} is not installed.\n` +
+      "Reinstall without --omit=optional / --no-optional, e.g. `npm i -g prwatch`.",
+  );
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+if (typeof process.execve === "function") {
+  try {
+    process.execve(bin, [bin, ...args], process.env);
+  } catch {
+    // Fall through to spawnSync.
+  }
+}
+
+const res = require("node:child_process").spawnSync(bin, args, { stdio: "inherit" });
+if (res.error) {
+  console.error(`prwatch: ${res.error.message}`);
+  process.exit(1);
+}
+if (res.signal) {
+  process.kill(process.pid, res.signal);
+}
+process.exit(res.status ?? 1);

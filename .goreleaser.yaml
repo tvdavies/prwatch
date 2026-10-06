@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: prwatch
+
+builds:
+  - id: prwatch
+    main: .
+    binary: prwatch
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  # Release archives: prwatch_0.1.0_linux_amd64.tar.gz etc.
+  - id: archive
+    ids: [prwatch]
+    formats: [tar.gz]
+    name_template: "prwatch_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+  # Bare binaries named for `gh extension install`, which picks the release
+  # asset whose name ends in <os>-<arch> (gh-extension-precompile style).
+  - id: gh-extension
+    ids: [prwatch]
+    formats: [binary]
+    name_template: "gh-prwatch_{{ .Tag }}_{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native
+
+release:
+  github:
+    owner: tvdavies
+    name: prwatch
