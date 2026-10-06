@@ -57,12 +57,38 @@ jobs:
           args: release --snapshot --clean
       - name: Build npm packages
         run: node scripts/npm-packages.mjs 0.0.0-ci
+      - name: Check the main package name and bin
+        run: |
+          test "$(node -p "require('./npm/dist/prwatch/package.json').name")" = "@tvdavies/prwatch"
+          test "$(node -p "require('./npm/dist/prwatch/package.json').bin.prwatch")" = "bin/prwatch"
       - name: Install from packed tarballs and check the bin is native
         run: |
           mkdir -p /tmp/tgz
           for d in prwatch-linux-x64 prwatch; do (cd "npm/dist/$d" && npm pack --pack-destination /tmp/tgz); done
-          npm install -g --prefix /tmp/npm-global /tmp/tgz/tvdavies-prwatch-linux-x64-0.0.0-ci.tgz /tmp/tgz/prwatch-0.0.0-ci.tgz
+          ls -l /tmp/tgz
+          platform=/tmp/tgz/tvdavies-prwatch-linux-x64-0.0.0-ci.tgz
+          main=/tmp/tgz/tvdavies-prwatch-0.0.0-ci.tgz
+
+          # check_no_node BIN: a blocking `prwatch wait` started via BIN must be
+          # the native binary itself, with no Node process left as its parent.
+          check_no_node() {
+            export PRWATCH_STATE_DIR="$(mktemp -d)" PRWATCH_GRAPHQL_URL=http://127.0.0.1:9 GH_TOKEN=ci
+            "$1" wait o/r#1 --timeout 20s & pid=$!
+            sleep 3
+            exe=$(readlink "/proc/$pid/exe")
+            echo "pid $pid runs $exe"
+            "$1" daemon stop || true
+            kill "$pid" || true
+            [ "$(basename "$exe")" = prwatch ] || { echo "prwatch is running under $exe, not natively" >&2; return 1; }
+            file -L "$exe" | grep -q ELF
+          }
+
+          npm install -g --prefix /tmp/npm-global "$platform" "$main"
           file -L /tmp/npm-global/bin/prwatch | tee /dev/stderr | grep -q ELF
           /tmp/npm-global/bin/prwatch version
-          npm install -g --ignore-scripts --prefix /tmp/npm-shim /tmp/tgz/tvdavies-prwatch-linux-x64-0.0.0-ci.tgz /tmp/tgz/prwatch-0.0.0-ci.tgz
+          check_no_node /tmp/npm-global/bin/prwatch
+
+          npm install -g --ignore-scripts --prefix /tmp/npm-shim "$platform" "$main"
+          test -d /tmp/npm-shim/lib/node_modules/@tvdavies/prwatch
           /tmp/npm-shim/bin/prwatch version
+          check_no_node /tmp/npm-shim/bin/prwatch

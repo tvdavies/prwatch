@@ -23,11 +23,13 @@ The daemon is written in Go, so each blocked waiter is a small static process (a
 Pick one:
 
 ```sh
-npm i -g prwatch                         # installs the native binary for your platform
-npx prwatch status owner/repo#1          # one-off use (see the note on memory below)
-gh extension install tvdavies/gh-prwatch # then run: gh prwatch …
+npm i -g @tvdavies/prwatch               # installs the native binary for your platform as `prwatch`
+npx @tvdavies/prwatch status owner/repo#1 # one-off use (see the note on memory below)
+gh extension install tvdavies/gh-prwatch  # then run: gh prwatch …
 go install github.com/tvdavies/prwatch@latest
 ```
+
+The npm package is scoped (`@tvdavies/prwatch`), but the command it installs is `prwatch`.
 
 Release binaries for Linux and macOS (amd64 and arm64) are on the [releases page](https://github.com/tvdavies/prwatch/releases). Windows isn't supported yet.
 
