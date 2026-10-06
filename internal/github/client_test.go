@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tvdavies/prwatch/internal/prref"
+	"github.com/tvdavies/prwatch/internal/snapshot"
 )
 
 func serve(t *testing.T, status int, headers map[string]string, body string) *Client {
@@ -287,5 +288,50 @@ func TestNullPRWithNestedErrorIsNotNotFound(t *testing.T) {
 				t.Fatalf("q1: a nested NOT_FOUND is not a missing PR: %T %v", r.Err, r.Err)
 			}
 		}
+	}
+}
+
+func TestEditTimesDecoded(t *testing.T) {
+	at := func(s string) *time.Time { v, _ := time.Parse(time.RFC3339, s); return &v }
+	p := &RawPR{State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", LastEditedAt: at("2026-10-01T10:00:00Z")}
+	p.LatestReviews.Nodes = []RawReview{{Author: &Actor{Login: "a"}, State: "COMMENTED", LastEditedAt: at("2026-10-01T11:00:00Z")}}
+	p.Comments.TotalCount = 1
+	p.Comments.Nodes = []RawComment{{Author: &Actor{Login: "b"}, LastEditedAt: at("2026-10-01T12:00:00Z")}}
+	p.ReviewThreads.TotalCount = 2
+	p.ReviewThreads.Nodes = []RawThread{{ID: "t1"}, {ID: "t2", IsResolved: true}}
+	p.RecentThreads.Nodes = make([]RawRecentThread, 2)
+	p.RecentThreads.Nodes[0].ID = "t1"
+	p.RecentThreads.Nodes[0].Comments.Nodes = []RawEdit{{}, {LastEditedAt: at("2026-10-01T13:00:00Z")}}
+	p.RecentThreads.Nodes[1].ID = "t2"
+	p.RecentThreads.Nodes[1].Comments.Nodes = []RawEdit{{LastEditedAt: at("2026-10-01T14:00:00Z")}}
+	s := ToSnapshot(p, prref.Ref{Owner: "o", Repo: "r", Number: 1}, time.Now())
+	if s.BodyEditedAt == nil || s.Reviews[0].EditedAt == nil || s.Comments.Recent[0].EditedAt == nil {
+		t.Fatalf("edit times not decoded: %+v", s)
+	}
+	// The resolved thread's edit counts for the PR; only open threads are items.
+	if len(s.Threads.Edits) != 2 || !s.Threads.Edits["t2"].Equal(*at("2026-10-01T14:00:00Z")) || !s.Threads.Items[0].EditedAt.Equal(*at("2026-10-01T13:00:00Z")) {
+		t.Fatalf("thread edits: %+v %+v", s.Threads.Edits, s.Threads.Items[0].EditedAt)
+	}
+	q, _ := PollQuery([]Target{{NodeID: "PR_1"}})
+	if !strings.Contains(q, "recentThreads: reviewThreads(last: 5)") || strings.Count(q, "lastEditedAt") != 4 {
+		t.Fatalf("query:\n%s", q)
+	}
+}
+
+func TestEditedThreadHeadIsRefetched(t *testing.T) {
+	edit := time.Date(2026, 10, 1, 13, 0, 0, 0, time.UTC)
+	s := &snapshot.Snapshot{Threads: snapshot.Threads{Items: []snapshot.Thread{{ID: "t1"}}}}
+	heads := map[string]ThreadHead{"t1": {Author: "a", Excerpt: "old"}}
+	if m := MissingThreads([]*snapshot.Snapshot{s}, heads); len(m) != 0 {
+		t.Fatalf("unedited head refetched: %v", m)
+	}
+	s.Threads.Items[0].EditedAt = &edit
+	if m := MissingThreads([]*snapshot.Snapshot{s}, heads); len(m) != 1 {
+		t.Fatalf("edited head not refetched: %v", m)
+	}
+	fresh := map[string]ThreadHead{"t1": {Author: "a", Excerpt: "new"}}
+	StampHeads([]*snapshot.Snapshot{s}, fresh)
+	if m := MissingThreads([]*snapshot.Snapshot{s}, fresh); len(m) != 0 {
+		t.Fatalf("stamped head refetched: %v", m)
 	}
 }

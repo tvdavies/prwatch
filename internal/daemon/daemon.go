@@ -743,6 +743,18 @@ func (d *Daemon) round() {
 			d.gov.Observe(rate)
 			cost += rate.Cost
 			d.mu.Lock()
+			// A thread refetched after an edit but not returned keeps its old
+			// head, re-stamped, rather than being requested every round.
+			for _, id := range chunk {
+				if _, ok := heads[id]; !ok {
+					if old, ok := d.heads[id]; ok {
+						heads[id] = old
+					}
+				}
+			}
+			d.mu.Unlock()
+			github.StampHeads(snaps, heads)
+			d.mu.Lock()
 			for k, v := range heads {
 				d.heads[k] = v
 			}

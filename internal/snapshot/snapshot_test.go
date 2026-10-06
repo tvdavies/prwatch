@@ -250,3 +250,127 @@ func TestIncompleteNeverSatisfiesConditions(t *testing.T) {
 		}
 	}
 }
+
+func goldenSnapshot() *Snapshot {
+	at := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	commit := "abc"
+	s := base()
+	s.ReviewDecision = str("APPROVED")
+	s.ReviewCount = 2
+	s.Reviews = []Review{{Author: "alice", State: "APPROVED", SubmittedAt: &at, Commit: &commit}}
+	s.Threads = Threads{Total: 3, Unresolved: 1, Items: []Thread{{ID: "T1", Path: "a.go"}}}
+	s.Comments = Comments{Total: 4, Recent: []Comment{{Author: "bob", CreatedAt: at, Excerpt: "hi"}}}
+	s.ReviewRequests = []string{"carol"}
+	s.Finalise()
+	return s
+}
+
+// A PR nothing has been edited on keeps the token 0.1.0 computed, so a
+// --since token survives an upgrade.
+func TestTokenUnchangedWithoutEdits(t *testing.T) {
+	if got := goldenSnapshot().Token; got != "1.723b09242140809b.78c4accf" {
+		t.Fatalf("token %s differs from 0.1.0", got)
+	}
+}
+
+func TestTokenCoversEdits(t *testing.T) {
+	a := goldenSnapshot()
+	ta, _ := ParseToken(a.Token)
+	edit := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		f      func(*Snapshot)
+		review bool
+	}{
+		{"description", func(s *Snapshot) { s.BodyEditedAt = &edit }, false},
+		{"comment", func(s *Snapshot) {
+			s.Comments.Recent = []Comment{{Author: "bob", CreatedAt: a.Comments.Recent[0].CreatedAt, Excerpt: "hi", EditedAt: &edit}}
+		}, false},
+		{"review", func(s *Snapshot) {
+			r := s.Reviews[0]
+			r.EditedAt = &edit
+			s.Reviews = []Review{r}
+		}, true},
+		{"thread comment", func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": edit} }, true},
+	}
+	for _, c := range cases {
+		b := mod(a, c.f)
+		tb, _ := ParseToken(b.Token)
+		if tb.All == ta.All {
+			t.Errorf("%s edit: all token unchanged", c.name)
+		}
+		if (tb.Review != ta.Review) != c.review {
+			t.Errorf("%s edit: review token changed=%v, want %v", c.name, tb.Review != ta.Review, c.review)
+		}
+		later := edit.Add(time.Minute)
+		again := mod(b, func(s *Snapshot) {
+			switch c.name {
+			case "description":
+				s.BodyEditedAt = &later
+			case "comment":
+				s.Comments.Recent = []Comment{{Author: "bob", CreatedAt: a.Comments.Recent[0].CreatedAt, Excerpt: "hi", EditedAt: &later}}
+			case "review":
+				r := s.Reviews[0]
+				r.EditedAt = &later
+				s.Reviews = []Review{r}
+			default:
+				s.Threads.Edits = map[string]time.Time{"T1": later}
+			}
+		})
+		if again.Token == b.Token {
+			t.Errorf("%s: a second edit did not change the token", c.name)
+		}
+	}
+}
+
+// Two threads edited with the same timestamp are still distinct edits.
+func TestTokenDistinguishesThreadEditsAtSameTime(t *testing.T) {
+	at := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	a := mod(goldenSnapshot(), func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": at} })
+	b := mod(a, func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": at, "T2": at} })
+	ta, _ := ParseToken(a.Token)
+	tb, _ := ParseToken(b.Token)
+	if ta.Review == tb.Review || ta.All == tb.All {
+		t.Fatal("second thread edit at the same time did not change the token")
+	}
+	if got := Changes(a, b); !reflect.DeepEqual(got, []string{"review edited"}) {
+		t.Fatalf("changes: %v", got)
+	}
+}
+
+func TestChangesReportsEdits(t *testing.T) {
+	a := goldenSnapshot()
+	edit := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	comment := mod(a, func(s *Snapshot) {
+		s.Comments.Recent = []Comment{{Author: "bob", CreatedAt: a.Comments.Recent[0].CreatedAt, Excerpt: "hi!", EditedAt: &edit}}
+	})
+	if got := Changes(a, comment); !reflect.DeepEqual(got, []string{"comment edited"}) {
+		t.Errorf("comment: %v", got)
+	}
+	review := mod(a, func(s *Snapshot) {
+		r := s.Reviews[0]
+		r.EditedAt = &edit
+		s.Reviews = []Review{r}
+	})
+	if got := Changes(a, review); !reflect.DeepEqual(got, []string{"review edited"}) {
+		t.Errorf("review: %v", got)
+	}
+	thread := mod(a, func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": edit} })
+	if got := Changes(a, thread); !reflect.DeepEqual(got, []string{"review edited"}) {
+		t.Errorf("thread: %v", got)
+	}
+	body := mod(a, func(s *Snapshot) { s.BodyEditedAt = &edit })
+	if got := Changes(a, body); !reflect.DeepEqual(got, []string{"description edited"}) {
+		t.Errorf("description: %v", got)
+	}
+	// A new review by the same author replaces an edited one: that is a new
+	// review, not an edit.
+	later := edit.Add(time.Hour)
+	newer := mod(review, func(s *Snapshot) {
+		s.Reviews = []Review{{Author: "alice", State: "COMMENTED", SubmittedAt: &later}}
+		s.ReviewCount++
+	})
+	if got := Changes(review, newer); !reflect.DeepEqual(got, []string{"reviews +1"}) {
+		t.Errorf("new review: %v", got)
+	}
+}
