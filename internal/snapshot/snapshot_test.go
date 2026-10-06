@@ -291,7 +291,7 @@ func TestTokenCoversEdits(t *testing.T) {
 			r.EditedAt = &edit
 			s.Reviews = []Review{r}
 		}, true},
-		{"thread comment", func(s *Snapshot) { s.Threads.EditedAt = &edit }, true},
+		{"thread comment", func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": edit} }, true},
 	}
 	for _, c := range cases {
 		b := mod(a, c.f)
@@ -314,12 +314,27 @@ func TestTokenCoversEdits(t *testing.T) {
 				r.EditedAt = &later
 				s.Reviews = []Review{r}
 			default:
-				s.Threads.EditedAt = &later
+				s.Threads.Edits = map[string]time.Time{"T1": later}
 			}
 		})
 		if again.Token == b.Token {
 			t.Errorf("%s: a second edit did not change the token", c.name)
 		}
+	}
+}
+
+// Two threads edited with the same timestamp are still distinct edits.
+func TestTokenDistinguishesThreadEditsAtSameTime(t *testing.T) {
+	at := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	a := mod(goldenSnapshot(), func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": at} })
+	b := mod(a, func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": at, "T2": at} })
+	ta, _ := ParseToken(a.Token)
+	tb, _ := ParseToken(b.Token)
+	if ta.Review == tb.Review || ta.All == tb.All {
+		t.Fatal("second thread edit at the same time did not change the token")
+	}
+	if got := Changes(a, b); !reflect.DeepEqual(got, []string{"review edited"}) {
+		t.Fatalf("changes: %v", got)
 	}
 }
 
@@ -340,7 +355,7 @@ func TestChangesReportsEdits(t *testing.T) {
 	if got := Changes(a, review); !reflect.DeepEqual(got, []string{"review edited"}) {
 		t.Errorf("review: %v", got)
 	}
-	thread := mod(a, func(s *Snapshot) { s.Threads.EditedAt = &edit })
+	thread := mod(a, func(s *Snapshot) { s.Threads.Edits = map[string]time.Time{"T1": edit} })
 	if got := Changes(a, thread); !reflect.DeepEqual(got, []string{"review edited"}) {
 		t.Errorf("thread: %v", got)
 	}

@@ -107,7 +107,7 @@ Editing the PR description, an issue comment, a review body or a review-thread c
   "threads": {
     "total": 4, "unresolved": 1,
     "items": [{ "id": "PRRT_…", "path": "main.go", "line": 42, "outdated": false, "author": "alice", "excerpt": "Could this…" }],
-    "editedAt": "…"
+    "edits": { "PRRT_…": "…" }
   },
   "checks": {
     "state": "SUCCESS", "total": 6,
@@ -131,7 +131,7 @@ The values come from GitHub's GraphQL API:
 - `reviewDecision` is null when no review policy applies.
 - `reviews` holds the latest review from each author.
 - `reviewCount` counts every review, including replies in threads.
-- `editedAt` and `bodyEditedAt` are GitHub's `lastEditedAt`, or null if never edited. `threads.editedAt` is the latest edit to a comment in the newest 5 threads; a thread item carries its own `editedAt` when it is one of them.
+- `editedAt` and `bodyEditedAt` are GitHub's `lastEditedAt`, or null if never edited. `threads.edits` maps each of the newest 5 threads with an edited comment to its latest edit (omitted when there are none); an unresolved thread item among them also carries its own `editedAt`.
 
 `incomplete` is true when GitHub returned the PR but an error nulled part of it (its checks, for example). `incompleteReason` then says which field failed and why. An incomplete snapshot is never treated as authoritative:
 - it never satisfies a `--for` condition and is never `ready_auto_merge_off`;

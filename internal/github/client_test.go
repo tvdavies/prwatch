@@ -309,8 +309,8 @@ func TestEditTimesDecoded(t *testing.T) {
 		t.Fatalf("edit times not decoded: %+v", s)
 	}
 	// The resolved thread's edit counts for the PR; only open threads are items.
-	if !s.Threads.EditedAt.Equal(*at("2026-10-01T14:00:00Z")) || !s.Threads.Items[0].EditedAt.Equal(*at("2026-10-01T13:00:00Z")) {
-		t.Fatalf("thread edits: %+v %+v", s.Threads.EditedAt, s.Threads.Items[0].EditedAt)
+	if len(s.Threads.Edits) != 2 || !s.Threads.Edits["t2"].Equal(*at("2026-10-01T14:00:00Z")) || !s.Threads.Items[0].EditedAt.Equal(*at("2026-10-01T13:00:00Z")) {
+		t.Fatalf("thread edits: %+v %+v", s.Threads.Edits, s.Threads.Items[0].EditedAt)
 	}
 	q, _ := PollQuery([]Target{{NodeID: "PR_1"}})
 	if !strings.Contains(q, "recentThreads: reviewThreads(last: 5)") || strings.Count(q, "lastEditedAt") != 4 {

@@ -1102,12 +1102,26 @@ func TestEditsWakeWaiters(t *testing.T) {
 		t.Fatalf("--for review on thread edit: exit %d: %s", r.code, r.stderr)
 	}
 	s := parseSnap(t, r.stdout)
-	if s.Threads.EditedAt == nil || s.Threads.Items[0].Excerpt != "Rename this, please" {
+	if len(s.Threads.Edits) != 1 || s.Threads.Items[0].Excerpt != "Rename this, please" {
 		t.Fatalf("threads after edit: %+v", s.Threads)
 	}
-	if n := strings.Count(ev.out.String(), `"changes":["review edited"]`); n != 2 {
-		t.Fatalf("want two review edited events:\n%s", ev.out.String())
+	eventually(t, 5*time.Second, "second review edited event", func() bool {
+		return strings.Count(ev.out.String(), `"changes":["review edited"]`) == 2
+	})
+
+	// Editing the description wakes --for change.
+	change = e.start("wait", "o/r#1", "--for", "change", "--json")
+	e.waitWatched(1, 2)
+	e.fake.Update(k, func(p *github.RawPR) {
+		at := time.Now().UTC()
+		p.LastEditedAt = &at
+	})
+	if r := change.wait(t, 5*time.Second); r.code != 0 || parseSnap(t, r.stdout).BodyEditedAt == nil {
+		t.Fatalf("--for change on description edit: exit %d: %s", r.code, r.stderr)
 	}
+	eventually(t, 5*time.Second, "description edited event", func() bool {
+		return strings.Contains(ev.out.String(), `"changes":["description edited"]`)
+	})
 }
 
 // A conflict caused by the base branch moving is seen even though nothing

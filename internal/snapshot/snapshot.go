@@ -83,9 +83,9 @@ type Threads struct {
 	// (100), so Unresolved may be an undercount.
 	Truncated bool     `json:"truncated"`
 	Items     []Thread `json:"items"`
-	// EditedAt is the latest edit to a comment in the newest
-	// RecentThreadWindow threads (their last 10 comments each), or null.
-	EditedAt *time.Time `json:"editedAt"`
+	// Edits maps each of the newest RecentThreadWindow threads that has an
+	// edited comment (among its last 10) to its latest edit time.
+	Edits map[string]time.Time `json:"edits,omitempty"`
 }
 
 // Thread is one unresolved review thread.
@@ -281,7 +281,7 @@ type reviewMaterial struct {
 	Count      int      `json:"c"`
 	Total      int      `json:"t"`
 	Open       []string `json:"o"`
-	ThreadEdit string   `json:"te,omitempty"`
+	ThreadEdit []string `json:"te,omitempty"`
 }
 
 type allMaterial struct {
@@ -311,7 +311,11 @@ type allMaterial struct {
 // the fetched window: the PR description, the newest issue comments, the
 // latest review per reviewer and the newest RecentThreadWindow threads.
 func ComputeToken(s *Snapshot) Token {
-	rm := reviewMaterial{Decision: s.ReviewDecision, Count: s.ReviewCount, Total: s.Threads.Total, ThreadEdit: stamp(s.Threads.EditedAt)}
+	rm := reviewMaterial{Decision: s.ReviewDecision, Count: s.ReviewCount, Total: s.Threads.Total}
+	for id, at := range s.Threads.Edits {
+		rm.ThreadEdit = append(rm.ThreadEdit, id+"|"+stamp(&at))
+	}
+	sort.Strings(rm.ThreadEdit)
 	for _, r := range s.Reviews {
 		var at, commit string
 		if r.SubmittedAt != nil {
@@ -523,10 +527,14 @@ func commentEdited(prev, cur *Snapshot) bool {
 }
 
 // reviewEdited reports whether a review body (same author and submission)
-// or a comment in a recent review thread has a newer edit.
+// or a comment in a recent review thread has a newer edit. A thread that
+// newly enters the window counts only if no threads were added.
 func reviewEdited(prev, cur *Snapshot) bool {
-	if c := cur.Threads.EditedAt; c != nil && (prev.Threads.EditedAt == nil || c.After(*prev.Threads.EditedAt)) {
-		return true
+	for id, at := range cur.Threads.Edits {
+		was, ok := prev.Threads.Edits[id]
+		if (ok || prev.Threads.Total == cur.Threads.Total) && !was.Equal(at) {
+			return true
+		}
 	}
 	seen := map[string]string{}
 	for _, r := range prev.Reviews {

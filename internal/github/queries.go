@@ -616,9 +616,10 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 			continue
 		}
 		threadEdits[t.ID] = last
-		if s.Threads.EditedAt == nil || last.After(*s.Threads.EditedAt) {
-			s.Threads.EditedAt = last
+		if s.Threads.Edits == nil {
+			s.Threads.Edits = map[string]time.Time{}
 		}
+		s.Threads.Edits[t.ID] = *last
 	}
 	for _, t := range p.ReviewThreads.Nodes {
 		if t.IsResolved {
