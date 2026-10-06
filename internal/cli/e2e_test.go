@@ -421,6 +421,39 @@ func TestSinceReturnsAtOnceAfterChangeBetweenCalls(t *testing.T) {
 	}
 }
 
+// A waiter that registers while the cached snapshot is still fresh must
+// re-arm the poller. The last subscriber leaving parks the poll loop with no
+// timer, and serving the cached snapshot used to skip the kick, so the poller
+// slept until some other client happened to kick it: the waiter never saw new
+// reviews (27 minutes in the field, with a one-minute interval).
+func TestWaiterServedFromCacheKeepsPolling(t *testing.T) {
+	// A long interval keeps the first snapshot fresh while the second waiter
+	// registers, which is the window the bug needs.
+	e := newEnv(t, "PRWATCH_POLL_FAST=3s", "PRWATCH_POLL_SLOW=3s")
+	k := e.fake.AddPR("o", "r", 1)
+
+	// The first wait starts the daemon, is answered by the first poll, and
+	// leaves: the PR has no subscribers for a moment.
+	first := e.run("wait", "o/r#1", "--json", "--timeout", "1s")
+	if first.code != 124 {
+		t.Fatalf("exit %d: %s", first.code, first.stderr)
+	}
+	tok := parseSnap(t, first.stdout).Token
+
+	// The next wait arrives inside the interval and is served from the cache.
+	p := e.start("wait", "o/r#1", "--since", tok, "--json", "--timeout", "15s")
+	e.waitWatched(1, 1)
+	e.fake.Update(k, func(p *github.RawPR) { p.Title = "Renamed" })
+
+	r := p.wait(t, 20*time.Second)
+	if r.code != 0 {
+		t.Fatalf("waiter served from the cache never saw the change: exit %d: %s", r.code, r.stderr)
+	}
+	if s := parseSnap(t, r.stdout); s.Title != "Renamed" {
+		t.Fatalf("unexpected snapshot title %q", s.Title)
+	}
+}
+
 func TestForConditions(t *testing.T) {
 	e := newEnv(t)
 	type tc struct {
