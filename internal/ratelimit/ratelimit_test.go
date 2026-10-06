@@ -15,6 +15,20 @@ func newGov(t *testing.T) (*Governor, *time.Time) {
 	return g, &now
 }
 
+func TestRecordRequestPersistsAndNeverGoesBack(t *testing.T) {
+	g, now := newGov(t)
+	g.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 4000, Cost: 1})
+	later := now.Add(3 * time.Second)
+	g.RecordRequest(later)
+	g.RecordRequest(now.Add(time.Second)) // older: ignored
+	g.RecordRequest(time.Time{})
+	reloaded := New(g.path)
+	st := reloaded.Snapshot()
+	if !st.UpdatedAt.Equal(later) || st.Remaining != 4000 {
+		t.Fatalf("reloaded state: updatedAt %s remaining %d; want %s and 4000", st.UpdatedAt, st.Remaining, later)
+	}
+}
+
 func TestRetryAfterIsHonoured(t *testing.T) {
 	g, now := newGov(t)
 	until := g.OnRateLimit(&github.RateLimitError{Secondary: true, RetryAfter: 90 * time.Second, Remaining: 4000})

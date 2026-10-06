@@ -190,6 +190,12 @@ func Run(cfg Config) error {
 	go func() { defer close(pollDone); d.pollLoop() }()
 	d.acceptLoop()
 	<-pollDone
+	// A request cancelled by the shutdown was never observed; record it so
+	// the next daemon still keeps the request gap after it.
+	d.mu.Lock()
+	last := d.lastRequest
+	d.mu.Unlock()
+	d.gov.RecordRequest(last)
 	waitTimeout(&d.wg, 2*time.Second)
 	saveIDs(paths.IDs(cfg.StateDir), d.snapshotIDs())
 	log.Info("daemon exiting", "rounds", d.rounds, "requests", d.requests, "reason", d.shutdownCode())

@@ -1010,12 +1010,8 @@ func cmdDaemonRestart(dir, version string, force bool) int {
 		} else {
 			fmt.Fprintf(Stdout, "daemon pid %d (version %s) cannot restart gracefully; stopping it (its waiters exit with \"daemon was stopped\")\n", old.PID, old.Version)
 		}
-		sm, _, err := client.Request(dir, protocol.OpStop)
-		if err != nil && !errors.Is(err, client.ErrNoDaemon) {
+		if err := stopPID(dir, old.PID); err != nil {
 			return fail(err)
-		}
-		if err == nil && sm.Type != protocol.TypeOK {
-			return fail(fmt.Errorf("unexpected reply from daemon: %s", sm.Type))
 		}
 	case m.Type == protocol.TypeError:
 		return fail(fmt.Errorf("daemon refused to restart: %s", m.Message))
@@ -1038,6 +1034,35 @@ func cmdDaemonRestart(dir, version string, force bool) int {
 			next.Version, version)
 	}
 	return ExitOK
+}
+
+// stopPID stops the daemon only if it is still the one with the given pid:
+// a concurrent restart may already have replaced it, and that successor
+// must not be stopped.
+func stopPID(dir string, pid int) error {
+	c, err := client.Dial(dir, false)
+	if errors.Is(err, client.ErrNoDaemon) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if c.Hello.PID != pid {
+		return nil
+	}
+	if err := c.Send(protocol.Request{Op: protocol.OpStop}); err != nil {
+		return err
+	}
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	m, err := c.Recv()
+	if err != nil {
+		return fmt.Errorf("daemon pid %d: %w", pid, err)
+	}
+	if m.Type != protocol.TypeOK {
+		return fmt.Errorf("unexpected reply from daemon: %s", m.Type)
+	}
+	return nil
 }
 
 // awaitSuccessor waits for a daemon other than oldPID to answer on the

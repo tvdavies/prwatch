@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -133,8 +134,14 @@ func TestRestartHandsOverWaitersAndStreams(t *testing.T) {
 	e.fake.Update(k1, func(p *github.RawPR) { p.Title = "Renamed in the gap" })
 	e.fake.Update(k2, func(p *github.RawPR) { fakegh.SetChecks(p, "SUCCESS") })
 	r := e.run("daemon", "restart")
-	if n := len(e.fake.Requests()); n != before {
-		t.Logf("the old daemon polled during the restart (%d requests); the gap check is weaker this run", n-before)
+	// The changes really were made in the gap: every request since was sent
+	// after the old daemon began handing over, so the old daemon never saw
+	// them and the waiters can only be woken by the new one.
+	handover := logTime(t, e.logText(), `msg="restart requested`)
+	for _, req := range e.fake.Requests()[before:] {
+		if req.At.Before(handover) {
+			t.Fatalf("the old daemon polled at %s, before the handover at %s; the test did not exercise the gap", req.At, handover)
+		}
 	}
 	if r.code != 0 {
 		t.Fatalf("restart: exit %d: %s %s", r.code, r.stdout, r.stderr)
@@ -210,19 +217,50 @@ func TestRestartHandsOverWaitersAndStreams(t *testing.T) {
 	}
 }
 
+// logTime returns the time of the first daemon log line containing what.
+func logTime(t *testing.T, log, what string) time.Time {
+	t.Helper()
+	for _, line := range strings.Split(log, "\n") {
+		if !strings.Contains(line, what) {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) > 0 && strings.HasPrefix(f[0], "time=") {
+			ts, err := time.Parse(time.RFC3339Nano, strings.TrimPrefix(f[0], "time="))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return ts
+		}
+	}
+	t.Fatalf("no log line with %q", what)
+	return time.Time{}
+}
+
 func TestSIGHUPHandsOverAndSIGTERMStops(t *testing.T) {
 	e := newEnv(t)
 	e.fake.AddPR("o", "r", 1)
+	timed := e.start("wait", "o/r#1", "--for", "merged", "--timeout", "6s")
+	timedStart := time.Now()
 	w := e.start("wait", "o/r#1", "--for", "merged")
 	ev := e.start("events", "--pr", "o/r#1", "--json")
-	e.waitWatched(1, 2)
+	e.waitWatched(1, 3)
 	eventually(t, 5*time.Second, "initial event", func() bool { return len(events(t, ev.out.String())) == 1 })
 	oldPID, _ := e.daemon()
 
 	if err := syscall.Kill(oldPID, syscall.SIGHUP); err != nil {
 		t.Fatal(err)
 	}
-	newPID := e.waitNewDaemon(oldPID, 1, 2)
+	newPID := e.waitNewDaemon(oldPID, 1, 3)
+
+	// The handover does not reset a waiter's deadline: it still times out
+	// 6s after it started. (Under -race each process takes an extra second
+	// to exit.)
+	r := timed.wait(t, 12*time.Second)
+	took := time.Since(timedStart)
+	if r.code != 124 || took < 6*time.Second || took > 7800*time.Millisecond {
+		t.Fatalf("timed waiter: exit %d after %s, want 124 after about 6s: %s", r.code, took, r.stderr)
+	}
 	if !w.running() || !ev.running() {
 		t.Fatalf("a client exited on SIGHUP: wait %q, events %q", w.errb.String(), ev.errb.String())
 	}
@@ -312,6 +350,17 @@ func TestNoVersionSkewWarning(t *testing.T) {
 // stops it. It holds the lock until stopped.
 func fakeOldDaemon(t *testing.T, dir string, clients int) {
 	t.Helper()
+	fakeOldDaemonWithSuccessor(t, dir, clients, -1)
+}
+
+// fakeOldDaemonWithSuccessor is fakeOldDaemon, except that from connection
+// successorAfter on (counting from 0; never if negative) it greets as a
+// 0.1.2 successor, pid 888888, as if a concurrent restart had replaced the
+// old daemon. It returns the ops the successor received.
+func fakeOldDaemonWithSuccessor(t *testing.T, dir string, clients, successorAfter int) func() []string {
+	t.Helper()
+	var mu sync.Mutex
+	var successorOps []string
 	lock, err := os.OpenFile(filepath.Join(dir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -326,10 +375,23 @@ func fakeOldDaemon(t *testing.T, dir string, clients int) {
 	stop := func() { ln.Close(); lock.Close() }
 	t.Cleanup(stop)
 	go func() {
-		for {
+		for n := 0; ; n++ {
 			c, err := ln.Accept()
 			if err != nil {
 				return
+			}
+			if successorAfter >= 0 && n >= successorAfter {
+				_, _ = c.Write([]byte(`{"type":"hello","protocol":1,"version":"0.1.2","pid":888888}` + "\n"))
+				_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				if line, err := bufio.NewReader(c).ReadBytes('\n'); err == nil {
+					var req protocol.Request
+					_ = json.Unmarshal(line, &req)
+					mu.Lock()
+					successorOps = append(successorOps, req.Op)
+					mu.Unlock()
+				}
+				c.Close()
+				continue
 			}
 			_, _ = c.Write([]byte(`{"type":"hello","protocol":1,"version":"0.1.1","pid":999999}` + "\n"))
 			line, err := bufio.NewReader(c).ReadBytes('\n')
@@ -353,6 +415,11 @@ func fakeOldDaemon(t *testing.T, dir string, clients int) {
 			c.Close()
 		}
 	}()
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), successorOps...)
+	}
 }
 
 func TestRestartOldDaemon(t *testing.T) {
@@ -395,6 +462,55 @@ func TestRestartOldIdleDaemonNeedsNoForce(t *testing.T) {
 	if r.code != 0 || !strings.Contains(r.stdout, "nothing is waiting on it; stopping it") ||
 		!strings.Contains(r.stdout, "-> pid ") {
 		t.Fatalf("exit %d: %q %q", r.code, r.stdout, r.stderr)
+	}
+}
+
+// Two restarts racing on one old daemon: by the time the second goes to
+// stop it, a successor owns the socket, and that successor must be left
+// alone.
+func TestLegacyRestartNeverStopsASuccessor(t *testing.T) {
+	e := newEnv(t)
+	// Connections 0 and 1 are restart's "restart" and "info"; from the
+	// third on, the socket belongs to a successor.
+	successorOps := fakeOldDaemonWithSuccessor(t, e.dir, 0, 2)
+	r := e.run("daemon", "restart")
+	if r.code != 0 || !strings.Contains(r.stdout, "daemon restarted: pid 999999 (version 0.1.1) -> pid 888888 (version 0.1.2)") {
+		t.Fatalf("exit %d: %q %q", r.code, r.stdout, r.stderr)
+	}
+	for _, op := range successorOps() {
+		if op == protocol.OpStop {
+			t.Fatalf("restart stopped the successor (ops %v)", successorOps())
+		}
+	}
+}
+
+// A request cancelled by the restart was never answered, but the new
+// daemon must still keep the request gap after it.
+func TestRestartKeepsGapAfterCancelledRequest(t *testing.T) {
+	e := newEnv(t, "PRWATCH_MIN_GAP=3s")
+	e.fake.AddPR("o", "r", 1)
+	w := e.start("wait", "o/r#1", "--for", "merged")
+	e.waitWatched(1, 1)
+	e.fake.SetDelay(time.Minute)
+	started := e.fake.Started()
+	eventually(t, 10*time.Second, "a poll in flight", func() bool { return e.fake.Started() > started })
+	e.fake.SetDelay(0) // for the new daemon; the poll in flight keeps its delay
+	answered := len(e.fake.Requests())
+	cancelled := time.Now()
+	oldPID, _ := e.daemon()
+	if r := e.run("daemon", "restart"); r.code != 0 {
+		t.Fatalf("restart: exit %d: %s", r.code, r.stderr)
+	}
+	e.waitNewDaemon(oldPID, 1, 1)
+	reqs := e.fake.Requests()[answered:]
+	if len(reqs) == 0 {
+		t.Fatal("the new daemon made no request")
+	}
+	if gap := reqs[0].At.Sub(cancelled); gap < 2900*time.Millisecond {
+		t.Fatalf("the new daemon asked GitHub %s after the cancelled request; the gap is 3s", gap)
+	}
+	if !w.running() {
+		t.Fatalf("waiter exited: %s", w.errb.String())
 	}
 }
 
