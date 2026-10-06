@@ -504,7 +504,6 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 	}
 	blockedUntil := d.blockedUntilLocked()
 	blocked := blockedUntil.After(now)
-	needKick := false
 	for _, ref := range refs {
 		key := ref.Key()
 		w := d.watches[key]
@@ -538,7 +537,6 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 			d.pendingSince = now
 		}
 		w.needsRefresh = true
-		needKick = true
 	}
 	if s.all {
 		for _, w := range d.watches {
@@ -548,9 +546,12 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 		}
 	}
 	d.log.Debug("client registered", "op", s.op, "for", s.forCond, "prs", len(refs), "active", d.active)
-	if needKick {
-		d.kickLocked()
-	}
+	// Always reschedule, even when every PR was served from the cache: when
+	// the last subscriber left, the poll loop parked with no timer, and only a
+	// kick re-arms it. Without one a waiter served from the cache never saw
+	// another poll. A kick only recomputes the next wake; the interval and
+	// request gap still decide when GitHub is asked.
+	d.kickLocked()
 	return true
 }
 
