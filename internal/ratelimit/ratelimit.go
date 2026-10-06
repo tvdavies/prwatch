@@ -97,6 +97,19 @@ func (g *Governor) Observe(r github.RateInfo) {
 	g.saveLocked()
 }
 
+// RecordRequest notes that a request was sent at t, even if no response
+// was observed (it was cancelled at shutdown, say), so that the next daemon
+// keeps the minimum gap after it. It never moves the time backwards.
+func (g *Governor) RecordRequest(t time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if t.IsZero() || !t.After(g.st.UpdatedAt) {
+		return
+	}
+	g.st.UpdatedAt = t
+	g.saveLocked()
+}
+
 // SetRoundCost records the total cost of the last poll round.
 func (g *Governor) SetRoundCost(c int) {
 	g.mu.Lock()

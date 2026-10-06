@@ -80,6 +80,10 @@ func ConfigFromEnv(version string) (Config, error) {
 		}
 		c.BudgetShare = f
 	}
+	// For tests: report a different version, to fake an older daemon.
+	if v := os.Getenv("PRWATCH_DAEMON_VERSION"); v != "" {
+		c.Version = v
+	}
 	if v := os.Getenv("PRWATCH_LOG_LEVEL"); v != "" {
 		var lvl slog.Level
 		if err := lvl.UnmarshalText([]byte(strings.ToUpper(v))); err != nil {

@@ -35,6 +35,40 @@ Release binaries for Linux and macOS (amd64 and arm64) are on the [releases page
 
 Authentication uses the first of these that is set: `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`. Tokens are never logged.
 
+## Upgrading
+
+```sh
+npm i -g @tvdavies/prwatch@latest && prwatch daemon restart
+```
+
+Installing a new version replaces the binary on disk, but a daemon that is already running carries on with the old one. `prwatch daemon restart` hands over to the new version without interrupting anyone:
+
+- the old daemon stops polling and tells every connected `wait` and `events` client to reconnect;
+- the first to reconnect starts a new daemon from the binary now on disk. If no waiter gets there first, `restart` starts it itself;
+- `restart` prints the old and new pid and version once the new daemon is up:
+
+  ```
+  daemon restarted: pid 41213 (version 0.1.2) -> pid 41388 (version 0.1.3)
+  3 waiters handed over
+  ```
+
+What carries over:
+
+- **Waiters** keep their deadline, `--for` condition and `--since` token. After reconnecting, a waiter compares the new daemon's first snapshot against its `--since` token, or the first snapshot it saw, so a change made during the handover still wakes it.
+- **`events` streams** keep the last state they printed for each PR. The new daemon's first snapshot is printed only if it differs, as a normal change line (`checks PENDING→SUCCESS`, say), never as a second `initial`.
+- **Rate-limit state** in `rate.json`: the remaining budget, any back-off and the time of the last request. The new daemon honours them before it sends anything. The node id cache (`ids.json`) also carries over.
+
+What it doesn't do:
+
+- It doesn't upgrade anything; it only restarts onto whatever binary is installed. A waiter keeps running its own (old) binary until it returns; only the daemon changes.
+- A daemon with nothing to watch still exits after the idle grace period.
+- The new daemon takes its environment, including the token and `PRWATCH_*` settings, from whichever process starts it: a reconnecting waiter or `restart`.
+- If nothing is running, `restart` says so and exits 0. The next `wait` or `events` starts the new version anyway.
+
+`prwatch list`, `prwatch rate` and `prwatch daemon status` warn when the daemon's version differs from the `prwatch` you ran, and suggest `prwatch daemon restart`. `list --json` includes `daemonVersion` and `clientVersion`.
+
+**Upgrading from 0.1.1 or earlier.** Those daemons don't know how to restart gracefully. `prwatch daemon restart` says so and leaves them alone: if it stopped them, their waiters would exit with `daemon was stopped`. Either let the old daemon exit once nothing is waiting (the next `wait` or `events` then starts the new version), or run `prwatch daemon restart --force` to stop it now. If nothing is waiting on it, `restart` stops it without `--force`. Waiters from 0.1.1 do survive a restart of a 0.1.2 or later daemon, but a 0.1.1 `events` stream prints one repeated `initial` line per PR when it reconnects.
+
 ## Commands
 
 A `<pr>` can be:
@@ -49,7 +83,7 @@ A `<pr>` can be:
 | `prwatch events [--pr <pr>]... [--json]` | Stream one line per change (JSON Lines with `--json`). Without `--pr`, streams every watched PR. Counts as a waiter. |
 | `prwatch list [--json]` | Show what the daemon is watching, who is waiting and the budget. Never starts or keeps alive the daemon. |
 | `prwatch rate [--json]` | Show the remaining budget, last cost, poll interval and any back-off. |
-| `prwatch daemon status` / `prwatch daemon stop` | Inspect or stop the daemon. |
+| `prwatch daemon status` / `stop` / `restart [--force]` | Inspect, stop or [restart](#upgrading) the daemon. |
 | `prwatch version` | Print the version. |
 
 ### `--for` conditions
@@ -168,6 +202,14 @@ A PR on which nothing has been edited keeps the same token as in 0.1.0.
   - The first comment of each new unresolved review thread costs one small extra request, made only when such threads appear. The result is cached, and fetched again after an edit in the thread.
   - A round of up to 10 PRs costs 1 point. The edit window adds a small nested connection, so bigger rounds cost a little more (about 3 points for 20 PRs, 7 for 50).
 - **Exit:** with no waiters left, the daemon exits after an idle grace period (30s by default) and removes the socket.
+- **Stop and restart:** there are two ways to end a daemon that has waiters.
+
+  | How | Effect on `wait` and `events` |
+  | --- | --- |
+  | `prwatch daemon restart`, or `SIGHUP` to the daemon | Graceful handover: they reconnect and carry on with a new daemon started from the binary on disk (see [Upgrading](#upgrading)). |
+  | `prwatch daemon stop`, or `SIGTERM` / `SIGINT` to the daemon | Hard stop: they print `daemon was stopped` and exit 1. No new daemon is started. |
+
+  If the daemon crashes or is killed with `SIGKILL`, clients see the connection drop and reconnect, as after a restart.
 
 ## Rate limits
 
@@ -190,7 +232,7 @@ Configuration is by environment variable, read when the daemon starts:
 | `PRWATCH_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 | `PRWATCH_POLL_FAST` / `PRWATCH_POLL_SLOW` | `10s` / `60s` | poll intervals (minimum 5s) |
 
-The daemon inherits its environment, including the token, from whichever client started it. Run `prwatch daemon stop` after changing configuration.
+The daemon inherits its environment, including the token, from whichever client started it. Run `prwatch daemon restart` after changing configuration; the new daemon takes its environment from whichever process starts it.
 
 ## Memory per waiter
 

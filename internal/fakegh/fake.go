@@ -51,6 +51,7 @@ type Server struct {
 	steps     map[string][]func(p *github.RawPR)
 	stepAt    map[string][]time.Time
 	reqAt     time.Time // when the request being served arrived
+	started   int       // requests received, including any still delayed or abandoned
 }
 
 // New starts a fake server.
@@ -189,6 +190,15 @@ func (s *Server) SetBudget(limit, remaining int) {
 	s.limit, s.remaining = limit, remaining
 }
 
+// Started counts authenticated requests received so far, including ones
+// still being delayed and ones the client abandoned. Requests counts only
+// those answered.
+func (s *Server) Started() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.started
+}
+
 // SetDelay delays every response by d.
 func (s *Server) SetDelay(d time.Duration) {
 	s.mu.Lock()
@@ -226,6 +236,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	delay := s.delay
+	s.started++
 	s.mu.Unlock()
 	if delay > 0 {
 		select {

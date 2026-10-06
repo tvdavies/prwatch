@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -108,7 +109,7 @@ func isNoListener(err error) bool {
 // Spawn starts a detached daemon: the same executable with the hidden
 // __daemon subcommand, in a new session, with output to the log file.
 func Spawn(stateDir string) error {
-	exe, err := os.Executable()
+	exe, err := Executable()
 	if err != nil {
 		return err
 	}
@@ -138,6 +139,38 @@ func Spawn(stateDir string) error {
 	// when it lost the start-up race).
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+// deletedSuffix is what Linux appends to /proc/self/exe once the running
+// binary has been unlinked, as npm does when it upgrades the package.
+const deletedSuffix = " (deleted)"
+
+// Executable returns the path to start a daemon from: the path this process
+// was started from, which after an upgrade holds the new binary.
+//
+// On Linux, os.Executable reads /proc/self/exe, which gains a " (deleted)"
+// suffix once the running binary has been replaced. Go strips the suffix
+// itself; it is stripped here too so that the result never depends on that.
+// On macOS, os.Executable returns the path the process was started from,
+// which likewise now holds the new binary. If nothing is at that path any
+// more (the package was moved or removed), it falls back to prwatch on PATH.
+func Executable() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return resolveExecutable(exe, exec.LookPath)
+}
+
+func resolveExecutable(exe string, lookPath func(string) (string, error)) (string, error) {
+	exe = strings.TrimSuffix(exe, deletedSuffix)
+	if fi, err := os.Stat(exe); err == nil && fi.Mode().IsRegular() {
+		return exe, nil
+	}
+	if p, err := lookPath("prwatch"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("the prwatch executable %s is gone and prwatch is not on PATH", exe)
 }
 
 func rotateLog(path string) {
@@ -176,16 +209,19 @@ func (c *Conn) SetReadDeadline(t time.Time) error { return c.c.SetReadDeadline(t
 // Close closes the connection, dropping any interest it registered.
 func (c *Conn) Close() error { return c.c.Close() }
 
-// Request is a convenience for one-shot ops (list, rate, info, stop).
-func Request(stateDir string, op string) (protocol.Message, error) {
+// Request is a convenience for one-shot ops (list, rate, info, stop,
+// restart). It also returns the daemon's greeting, which carries its
+// version and pid.
+func Request(stateDir string, op string) (protocol.Message, protocol.Hello, error) {
 	c, err := Dial(stateDir, false)
 	if err != nil {
-		return protocol.Message{}, err
+		return protocol.Message{}, protocol.Hello{}, err
 	}
 	defer c.Close()
 	if err := c.Send(protocol.Request{Op: op}); err != nil {
-		return protocol.Message{}, err
+		return protocol.Message{}, c.Hello, err
 	}
 	_ = c.c.SetReadDeadline(time.Now().Add(10 * time.Second))
-	return c.Recv()
+	m, err := c.Recv()
+	return m, c.Hello, err
 }

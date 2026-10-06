@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tvdavies/prwatch/internal/client"
@@ -52,7 +53,7 @@ Usage:
   prwatch events [--pr <pr>]... [--json]
   prwatch list [--json]
   prwatch rate [--json]
-  prwatch daemon status|stop
+  prwatch daemon status|stop|restart [--force]
   prwatch version
 
 A <pr> is owner/repo#123, a GitHub PR URL, or 123 (or '#123') inside a
@@ -79,11 +80,11 @@ func Main(args []string, version string) int {
 	case "events":
 		return cmdEvents(rest)
 	case "list":
-		return cmdList(rest)
+		return cmdList(rest, version)
 	case "rate":
-		return cmdRate(rest)
+		return cmdRate(rest, version)
 	case "daemon":
-		return cmdDaemon(rest)
+		return cmdDaemon(rest, version)
 	case "version", "--version", "-v":
 		fmt.Fprintf(Stdout, "prwatch %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 		return ExitOK
@@ -369,8 +370,12 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 					}
 					return ExitError, true
 				case protocol.TypeShutdown:
+					// After a restart or an idle exit, reconnect: the first
+					// client back starts a new daemon. The handler keeps its
+					// state, so a wait keeps its deadline, condition and
+					// baseline, and events keeps the last state it printed.
 					conn.Close()
-					if m.Code == "stopped" {
+					if m.Code == protocol.ShutdownStopped {
 						fmt.Fprintln(Stderr, "prwatch: daemon was stopped")
 						return ExitError, true
 					}
@@ -620,10 +625,25 @@ func cmdEvents(args []string) int {
 	for _, r := range refs {
 		names = append(names, r.String())
 	}
+	// The last state printed for each PR. After a reconnect (a daemon
+	// restart, say) the new daemon sends each PR's state as "initial": that
+	// is suppressed when nothing changed, and reported as a change against
+	// what was last printed when something did.
+	printed := map[string]*snapshot.Snapshot{}
 	code, _ := stream(dir, protocol.Request{Op: protocol.OpEvents, PRs: names}, time.Time{}, func(m protocol.Message) (int, bool) {
 		if m.Snapshot == nil {
 			return 0, false
 		}
+		key := strings.ToLower(m.Snapshot.PR)
+		if prev := printed[key]; prev != nil {
+			if snapshot.ComputeToken(prev) == snapshot.ComputeToken(m.Snapshot) {
+				return 0, false
+			}
+			if len(m.Changes) == 1 && m.Changes[0] == "initial" {
+				m.Changes = snapshot.Changes(prev, m.Snapshot)
+			}
+		}
+		printed[key] = m.Snapshot
 		if *asJSON {
 			b, _ := json.Marshal(struct {
 				Type     string             `json:"type"`
@@ -648,7 +668,17 @@ Lists the PRs the daemon is watching. Does not start a daemon or keep one
 alive.
 `
 
-func cmdList(args []string) int {
+// warnSkew warns when the daemon runs a different version from this binary,
+// typically because prwatch was upgraded while the daemon was running.
+func warnSkew(daemonVersion, version string) {
+	if daemonVersion == "" || daemonVersion == version {
+		return
+	}
+	fmt.Fprintf(Stderr, "prwatch: warning: the daemon is version %s but this prwatch is %s; run `prwatch daemon restart` to switch to %s\n",
+		daemonVersion, version, version)
+}
+
+func cmdList(args []string, version string) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "")
 	pos, err := parseFlags(fs, args)
@@ -662,10 +692,10 @@ func cmdList(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	m, err := client.Request(dir, protocol.OpList)
+	m, _, err := client.Request(dir, protocol.OpList)
 	if errors.Is(err, client.ErrNoDaemon) {
 		if *asJSON {
-			fmt.Fprintln(Stdout, `{"prs":[],"daemon":null}`)
+			fmt.Fprintf(Stdout, `{"prs":[],"daemon":null,"daemonVersion":null,"clientVersion":%q}`+"\n", version)
 		} else {
 			fmt.Fprintln(Stdout, "Nothing is being watched (no daemon running).")
 		}
@@ -678,17 +708,21 @@ func cmdList(args []string) int {
 		return fail(fmt.Errorf("unexpected reply from daemon: %s", m.Type))
 	}
 	l := m.List
+	warnSkew(l.DaemonVersion, version)
 	if *asJSON {
 		b, _ := json.MarshalIndent(struct {
-			PRs    []protocol.Watched `json:"prs"`
-			Daemon any                `json:"daemon"`
-		}{l.PRs, map[string]any{"pid": l.DaemonPID, "version": l.DaemonVersion, "allStreams": l.AllStreams, "rate": l.Rate}}, "", "  ")
+			PRs           []protocol.Watched `json:"prs"`
+			Daemon        any                `json:"daemon"`
+			DaemonVersion string             `json:"daemonVersion"`
+			ClientVersion string             `json:"clientVersion"`
+		}{l.PRs, map[string]any{"pid": l.DaemonPID, "version": l.DaemonVersion, "allStreams": l.AllStreams, "rate": l.Rate},
+			l.DaemonVersion, version}, "", "  ")
 		fmt.Fprintln(Stdout, string(b))
 		return ExitOK
 	}
 	now := time.Now()
 	if len(l.PRs) == 0 {
-		fmt.Fprintf(Stdout, "Nothing is being watched (daemon pid %d is idle).\n", l.DaemonPID)
+		fmt.Fprintf(Stdout, "Nothing is being watched (daemon pid %d, version %s, is idle).\n", l.DaemonPID, l.DaemonVersion)
 	}
 	for _, w := range l.PRs {
 		title := w.Title
@@ -714,6 +748,7 @@ func cmdList(args []string) int {
 	}
 	fmt.Fprintln(Stdout)
 	fmt.Fprintf(Stdout, "poll interval %s · %s · back-off: %s\n", l.Rate.Interval, budget(l.Rate, now), backoff(l.Rate, now))
+	fmt.Fprintf(Stdout, "daemon pid %d, version %s\n", l.DaemonPID, l.DaemonVersion)
 	return ExitOK
 }
 
@@ -760,7 +795,7 @@ func backoff(r protocol.Rate, now time.Time) string {
 	return s
 }
 
-func cmdRate(args []string) int {
+func cmdRate(args []string, version string) int {
 	fs := flag.NewFlagSet("rate", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "")
 	if _, err := parseFlags(fs, args); err != nil {
@@ -772,7 +807,7 @@ func cmdRate(args []string) int {
 	}
 	var r protocol.Rate
 	running := true
-	m, err := client.Request(dir, protocol.OpRate)
+	m, hello, err := client.Request(dir, protocol.OpRate)
 	switch {
 	case errors.Is(err, client.ErrNoDaemon):
 		running = false
@@ -790,6 +825,7 @@ func cmdRate(args []string) int {
 		return fail(fmt.Errorf("unexpected reply from daemon: %s", m.Type))
 	default:
 		r = *m.Rate
+		warnSkew(hello.Version, version)
 	}
 	if *asJSON {
 		b, _ := json.MarshalIndent(struct {
@@ -811,33 +847,79 @@ func cmdRate(args []string) int {
 	return ExitOK
 }
 
-func cmdDaemon(args []string) int {
-	if len(args) != 1 || (args[0] != "status" && args[0] != "stop") {
-		return usageErr("usage: prwatch daemon status|stop")
+const daemonHelp = `Usage: prwatch daemon status|stop|restart [--force]
+
+  status   show the running daemon's pid, version, waiters and PRs
+  stop     stop the daemon; waiters exit with "daemon was stopped" (exit 1)
+  restart  hand over to a new daemon started from the prwatch binary now on
+           disk, for example after an upgrade. Waiters and events streams
+           reconnect and carry on. Persisted state (rate.json) carries over.
+           --force stops a daemon too old to restart gracefully (0.1.1 or
+           earlier), ending its waiters with "daemon was stopped".
+
+SIGHUP to the daemon restarts it like restart; SIGTERM and SIGINT stop it.
+`
+
+func cmdDaemon(args []string, version string) int {
+	if len(args) == 0 {
+		return usageErr("%s", strings.TrimSuffix(daemonHelp, "\n"))
+	}
+	switch args[0] {
+	case "status", "stop":
+		if len(args) != 1 {
+			return usageErr("daemon %s takes no arguments", args[0])
+		}
+	case "restart":
+	case "help", "-h", "--help":
+		fmt.Fprint(Stdout, daemonHelp)
+		return ExitOK
+	default:
+		return usageErr("%s", strings.TrimSuffix(daemonHelp, "\n"))
 	}
 	dir, err := stateDir()
 	if err != nil {
 		return fail(err)
 	}
-	if args[0] == "status" {
-		m, err := client.Request(dir, protocol.OpInfo)
-		if errors.Is(err, client.ErrNoDaemon) {
-			fmt.Fprintln(Stdout, "daemon not running")
-			return ExitError
-		}
+	switch args[0] {
+	case "status":
+		return cmdDaemonStatus(dir, version)
+	case "restart":
+		fs := flag.NewFlagSet("daemon restart", flag.ContinueOnError)
+		force := fs.Bool("force", false, "")
+		pos, err := parseFlags(fs, args[1:])
 		if err != nil {
-			return fail(err)
+			return flagError(fs, err, daemonHelp)
 		}
-		if m.Info == nil {
-			return fail(fmt.Errorf("unexpected reply from daemon: %s", m.Type))
+		if len(pos) > 0 {
+			return usageErr("daemon restart takes no arguments")
 		}
-		i := m.Info
-		fmt.Fprintf(Stdout, "daemon running: pid %d, version %s, up %s\n", i.PID, i.Version, ago(time.Since(i.StartedAt)))
-		fmt.Fprintf(Stdout, "%s, watching %s\n", plural(i.Clients, "waiter"), plural(i.PRs, "PR"))
-		fmt.Fprintf(Stdout, "socket %s\nlog %s\n", i.Socket, i.Log)
-		return ExitOK
+		return cmdDaemonRestart(dir, version, *force)
 	}
-	m, err := client.Request(dir, protocol.OpStop)
+	return cmdDaemonStop(dir)
+}
+
+func cmdDaemonStatus(dir, version string) int {
+	m, _, err := client.Request(dir, protocol.OpInfo)
+	if errors.Is(err, client.ErrNoDaemon) {
+		fmt.Fprintln(Stdout, "daemon not running")
+		return ExitError
+	}
+	if err != nil {
+		return fail(err)
+	}
+	if m.Info == nil {
+		return fail(fmt.Errorf("unexpected reply from daemon: %s", m.Type))
+	}
+	i := m.Info
+	fmt.Fprintf(Stdout, "daemon running: pid %d, version %s, up %s\n", i.PID, i.Version, ago(time.Since(i.StartedAt)))
+	fmt.Fprintf(Stdout, "%s, watching %s\n", plural(i.Clients, "waiter"), plural(i.PRs, "PR"))
+	fmt.Fprintf(Stdout, "socket %s\nlog %s\n", i.Socket, i.Log)
+	warnSkew(i.Version, version)
+	return ExitOK
+}
+
+func cmdDaemonStop(dir string) int {
+	m, hello, err := client.Request(dir, protocol.OpStop)
 	if errors.Is(err, client.ErrNoDaemon) {
 		fmt.Fprintln(Stdout, "daemon not running")
 		return ExitOK
@@ -848,13 +930,159 @@ func cmdDaemon(args []string) int {
 	if m.Type != protocol.TypeOK {
 		return fail(fmt.Errorf("unexpected reply from daemon: %s", m.Type))
 	}
-	sock := paths.Socket(dir)
-	for i := 0; i < 100; i++ {
-		if _, err := os.Stat(sock); os.IsNotExist(err) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	waitGone(dir, hello.PID, 5*time.Second)
 	fmt.Fprintln(Stdout, "daemon stopped")
 	return ExitOK
+}
+
+// waitGone waits up to d for the daemon with the given pid to exit and its
+// socket to go.
+func waitGone(dir string, pid int, d time.Duration) bool {
+	sock := paths.Socket(dir)
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		_, err := os.Stat(sock)
+		if os.IsNotExist(err) && !processAlive(pid) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// cmdDaemonRestart asks the running daemon to hand over gracefully, then
+// makes sure a new daemon is up, started from this binary if no waiter got
+// there first, and reports both.
+func cmdDaemonRestart(dir, version string, force bool) int {
+	conn, err := client.Dial(dir, false)
+	if errors.Is(err, client.ErrNoDaemon) {
+		fmt.Fprintf(Stdout, "daemon not running; nothing to restart (the next wait or events starts version %s)\n", version)
+		return ExitOK
+	}
+	if err != nil {
+		return fail(err)
+	}
+	old := conn.Hello
+	err = conn.Send(protocol.Request{Op: protocol.OpRestart})
+	var m protocol.Message
+	if err == nil {
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		m, err = conn.Recv()
+	}
+	conn.Close()
+	if err != nil {
+		return fail(fmt.Errorf("daemon pid %d: %w", old.PID, err))
+	}
+	handedOver := -1
+	switch {
+	case m.Type == protocol.TypeOK:
+		if m.Info != nil {
+			handedOver = m.Info.Clients
+		}
+	case m.Type == protocol.TypeError && strings.HasPrefix(m.Message, "unknown op"):
+		// A daemon from 0.1.1 or earlier: it can only be stopped, which
+		// ends its waiters with "daemon was stopped".
+		clients := -1
+		if im, _, err := client.Request(dir, protocol.OpInfo); err == nil && im.Info != nil && im.Info.PID == old.PID {
+			clients = im.Info.Clients
+		}
+		if clients != 0 && !force {
+			who := "its waiters"
+			if clients > 0 {
+				who = "its " + plural(clients, "waiter")
+			}
+			fmt.Fprintf(Stderr, "prwatch: daemon pid %d is version %s, which cannot restart gracefully.\n", old.PID, old.Version)
+			fmt.Fprintf(Stderr, "Stopping it now would end %s with \"daemon was stopped\".\n", who)
+			fmt.Fprintf(Stderr, "Either leave it to exit once nothing is waiting (the next wait or events then starts version %s),\n", version)
+			fmt.Fprintln(Stderr, "or run `prwatch daemon restart --force` to stop it now.")
+			return ExitError
+		}
+		if clients == 0 {
+			fmt.Fprintf(Stdout, "daemon pid %d (version %s) cannot restart gracefully, but nothing is waiting on it; stopping it\n", old.PID, old.Version)
+		} else {
+			fmt.Fprintf(Stdout, "daemon pid %d (version %s) cannot restart gracefully; stopping it (its waiters exit with \"daemon was stopped\")\n", old.PID, old.Version)
+		}
+		if err := stopPID(dir, old.PID); err != nil {
+			return fail(err)
+		}
+	case m.Type == protocol.TypeError:
+		return fail(fmt.Errorf("daemon refused to restart: %s", m.Message))
+	default:
+		return fail(fmt.Errorf("unexpected reply from daemon: %s", m.Type))
+	}
+
+	// Reconnecting waiters may already have started the new daemon; if not,
+	// start it from this binary.
+	next, err := awaitSuccessor(dir, old.PID, 20*time.Second)
+	if err != nil {
+		return fail(fmt.Errorf("the old daemon (pid %d) has gone but no new one came up: %w", old.PID, err))
+	}
+	fmt.Fprintf(Stdout, "daemon restarted: pid %d (version %s) -> pid %d (version %s)\n", old.PID, old.Version, next.PID, next.Version)
+	if handedOver > 0 {
+		fmt.Fprintf(Stdout, "%s handed over\n", plural(handedOver, "waiter"))
+	}
+	if next.Version != version {
+		fmt.Fprintf(Stderr, "prwatch: warning: the new daemon is version %s but this prwatch is %s; a waiter started it from another binary\n",
+			next.Version, version)
+	}
+	return ExitOK
+}
+
+// stopPID stops the daemon only if it is still the one with the given pid:
+// a concurrent restart may already have replaced it, and that successor
+// must not be stopped.
+func stopPID(dir string, pid int) error {
+	c, err := client.Dial(dir, false)
+	if errors.Is(err, client.ErrNoDaemon) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if c.Hello.PID != pid {
+		return nil
+	}
+	if err := c.Send(protocol.Request{Op: protocol.OpStop}); err != nil {
+		return err
+	}
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	m, err := c.Recv()
+	if err != nil {
+		return fmt.Errorf("daemon pid %d: %w", pid, err)
+	}
+	if m.Type != protocol.TypeOK {
+		return fmt.Errorf("unexpected reply from daemon: %s", m.Type)
+	}
+	return nil
+}
+
+// awaitSuccessor waits for a daemon other than oldPID to answer on the
+// socket, starting one from this binary when nothing is listening.
+func awaitSuccessor(dir string, oldPID int, d time.Duration) (protocol.Hello, error) {
+	deadline := time.Now().Add(d)
+	for {
+		c, err := client.DialUntil(dir, true, deadline)
+		if err != nil {
+			return protocol.Hello{}, err
+		}
+		h := c.Hello
+		c.Close()
+		if h.PID != oldPID {
+			return h, nil
+		}
+		// The old daemon has replied but not yet closed its socket.
+		if time.Now().After(deadline) {
+			return protocol.Hello{}, client.ErrDeadline
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

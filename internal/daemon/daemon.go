@@ -6,6 +6,12 @@
 // connection is an interest registration. The daemon polls the union of
 // PRs that open connections care about, never sends requests concurrently,
 // and exits after an idle grace period once the last waiter has gone.
+//
+// There are three ways to shut down. An idle exit and a graceful restart
+// (prwatch daemon restart, or SIGHUP) both tell clients to reconnect; the
+// first to do so starts a fresh daemon from the executable now on disk. An
+// explicit stop (prwatch daemon stop, SIGTERM or SIGINT) tells clients the
+// daemon was stopped, and they exit.
 package daemon
 
 import (
@@ -54,6 +60,26 @@ type sub struct {
 	out       chan protocol.Message
 }
 
+// shutdownMode records why the daemon is shutting down.
+type shutdownMode int
+
+const (
+	modeIdle    shutdownMode = iota // idle grace elapsed
+	modeStop                        // explicit stop: clients exit
+	modeRestart                     // graceful restart: clients reconnect
+)
+
+// code is the shutdown code sent to connected clients.
+func (m shutdownMode) code() string {
+	switch m {
+	case modeStop:
+		return protocol.ShutdownStopped
+	case modeRestart:
+		return protocol.ShutdownRestarting
+	}
+	return protocol.ShutdownStopping
+}
+
 // Daemon is the running poller and socket server.
 type Daemon struct {
 	cfg    Config
@@ -74,7 +100,7 @@ type Daemon struct {
 	idleTimer    *time.Timer
 	idleGen      int
 	shuttingDown bool
-	stopped      bool
+	mode         shutdownMode
 	startedAt    time.Time
 	interval     time.Duration
 	lastRound    time.Time
@@ -138,13 +164,20 @@ func Run(cfg Config) error {
 		"idleGrace", cfg.IdleGrace, "fast", cfg.FastInterval, "slow", cfg.SlowInterval, "budgetShare", cfg.BudgetShare)
 	d.restoreRateState()
 
+	// SIGHUP hands over gracefully, like prwatch daemon restart; SIGTERM
+	// and SIGINT are an explicit stop.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	defer signal.Stop(sigs)
 	go func() {
 		select {
 		case s := <-sigs:
-			log.Info("signal received", "signal", s.String())
-			d.shutdown(true)
+			mode := modeStop
+			if s == syscall.SIGHUP {
+				mode = modeRestart
+			}
+			log.Info("signal received", "signal", s.String(), "restart", mode == modeRestart)
+			d.shutdown(mode)
 		case <-d.done:
 		}
 	}()
@@ -157,9 +190,15 @@ func Run(cfg Config) error {
 	go func() { defer close(pollDone); d.pollLoop() }()
 	d.acceptLoop()
 	<-pollDone
+	// A request cancelled by the shutdown was never observed; record it so
+	// the next daemon still keeps the request gap after it.
+	d.mu.Lock()
+	last := d.lastRequest
+	d.mu.Unlock()
+	d.gov.RecordRequest(last)
 	waitTimeout(&d.wg, 2*time.Second)
 	saveIDs(paths.IDs(cfg.StateDir), d.snapshotIDs())
-	log.Info("daemon exiting", "rounds", d.rounds, "requests", d.requests)
+	log.Info("daemon exiting", "rounds", d.rounds, "requests", d.requests, "reason", d.shutdownCode())
 	return nil
 }
 
@@ -237,11 +276,12 @@ func (d *Daemon) acceptLoop() {
 	}
 }
 
-// shutdown stops accepting connections and ends the poller. stop marks an
-// explicit stop, which clients report rather than reconnecting after.
-func (d *Daemon) shutdown(stop bool) {
+// shutdown stops accepting connections and ends the poller. The mode decides
+// what connected clients are told: after an explicit stop they exit, after a
+// restart or idle exit they reconnect.
+func (d *Daemon) shutdown(mode shutdownMode) {
 	d.mu.Lock()
-	ok := d.beginShutdownLocked(stop)
+	ok := d.beginShutdownLocked(mode)
 	d.mu.Unlock()
 	if ok {
 		d.finishShutdown()
@@ -250,12 +290,12 @@ func (d *Daemon) shutdown(stop bool) {
 
 // beginShutdownLocked commits to shutting down; from here register refuses
 // new interest, so clients reconnect to a fresh daemon.
-func (d *Daemon) beginShutdownLocked(stop bool) bool {
+func (d *Daemon) beginShutdownLocked(mode shutdownMode) bool {
 	if d.shuttingDown {
 		return false
 	}
 	d.shuttingDown = true
-	d.stopped = stop
+	d.mode = mode
 	if d.idleTimer != nil {
 		d.idleTimer.Stop()
 	}
@@ -277,7 +317,7 @@ func (d *Daemon) startIdleTimerLocked() {
 	gen := d.idleGen
 	d.idleTimer = time.AfterFunc(d.cfg.IdleGrace, func() {
 		d.mu.Lock()
-		ok := gen == d.idleGen && d.active == 0 && d.beginShutdownLocked(false)
+		ok := gen == d.idleGen && d.active == 0 && d.beginShutdownLocked(modeIdle)
 		d.mu.Unlock()
 		if ok {
 			d.log.Info("idle grace elapsed with no waiters; exiting", "grace", d.cfg.IdleGrace)
@@ -316,9 +356,12 @@ func (d *Daemon) handle(conn net.Conn) {
 		_ = w.send(protocol.Message{Type: protocol.TypeError, Code: protocol.CodeBadRequest, Message: "malformed request"})
 		return
 	}
-	if req.Protocol != protocol.Version {
+	// stop, restart and info carry nothing but the op, so they are served
+	// whatever protocol the client speaks: a client from a future release
+	// can still inspect and replace this daemon.
+	if req.Protocol != protocol.Version && req.Op != protocol.OpStop && req.Op != protocol.OpRestart && req.Op != protocol.OpInfo {
 		_ = w.send(protocol.Message{Type: protocol.TypeError, Code: protocol.CodeBadRequest,
-			Message: "protocol version mismatch; run `prwatch daemon stop` after upgrading"})
+			Message: "protocol version mismatch; run `prwatch daemon restart` after upgrading"})
 		return
 	}
 	switch req.Op {
@@ -336,7 +379,12 @@ func (d *Daemon) handle(conn net.Conn) {
 	case protocol.OpStop:
 		_ = w.send(protocol.Message{Type: protocol.TypeOK})
 		d.log.Info("stop requested")
-		d.shutdown(true)
+		d.shutdown(modeStop)
+	case protocol.OpRestart:
+		inf := d.info()
+		_ = w.send(protocol.Message{Type: protocol.TypeOK, Info: &inf})
+		d.log.Info("restart requested; handing over to a new daemon", "clients", inf.Clients, "prs", inf.PRs)
+		d.shutdown(modeRestart)
 	default:
 		_ = w.send(protocol.Message{Type: protocol.TypeError, Code: protocol.CodeBadRequest, Message: "unknown op " + req.Op})
 	}
@@ -378,7 +426,9 @@ func (d *Daemon) serveSubscription(conn net.Conn, r *bufio.Reader, w connWriter,
 		s.forCond = snapshot.ForChange
 	}
 	if !d.register(s, refs) {
-		_ = w.send(protocol.Message{Type: protocol.TypeShutdown, Code: "stopping"})
+		// The request raced shutdown: whatever the reason, it never got a
+		// daemon, so it reconnects (and starts a new one).
+		_ = w.send(protocol.Message{Type: protocol.TypeShutdown, Code: protocol.ShutdownStopping})
 		return
 	}
 	defer d.unregister(s)
@@ -411,16 +461,16 @@ func (d *Daemon) serveSubscription(conn net.Conn, r *bufio.Reader, w connWriter,
 		case <-gone:
 			return
 		case <-d.done:
-			code := "stopping"
-			d.mu.Lock()
-			if d.stopped {
-				code = "stopped"
-			}
-			d.mu.Unlock()
-			_ = w.send(protocol.Message{Type: protocol.TypeShutdown, Code: code})
+			_ = w.send(protocol.Message{Type: protocol.TypeShutdown, Code: d.shutdownCode()})
 			return
 		}
 	}
+}
+
+func (d *Daemon) shutdownCode() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mode.code()
 }
 
 func (s *sub) deliver(log *slog.Logger, m protocol.Message) {

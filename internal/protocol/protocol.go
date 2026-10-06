@@ -5,6 +5,12 @@
 // line. For wait, events and status the connection then carries Message
 // lines from the daemon; the client's open connection is its interest
 // registration, so closing it drops the interest.
+//
+// Compatibility: the protocol stays at version 1 while changes are
+// additive. Clients ignore message fields and shutdown codes they do not
+// know, and treat any shutdown code other than "stopped" as a cue to
+// reconnect. Daemons answer an op they do not know with a bad_request error
+// whose message starts "unknown op", which a newer client can detect.
 package protocol
 
 import (
@@ -26,6 +32,24 @@ const (
 	OpRate   = "rate"
 	OpInfo   = "info"
 	OpStop   = "stop"
+	// OpRestart asks the daemon to hand over gracefully: it replies OK with
+	// its Info, then shuts down without the "stopped" code, so wait and
+	// events clients reconnect and the first of them starts a fresh daemon.
+	// Added in 0.1.2; older daemons reply "unknown op restart".
+	OpRestart = "restart"
+)
+
+// Shutdown codes, sent in a TypeShutdown message's Code.
+const (
+	// ShutdownStopped is an explicit stop (prwatch daemon stop, SIGTERM or
+	// SIGINT). Clients report it and exit rather than reconnecting.
+	ShutdownStopped = "stopped"
+	// ShutdownStopping is an idle exit or a request that raced shutdown.
+	// Clients reconnect, starting a new daemon if needed.
+	ShutdownStopping = "stopping"
+	// ShutdownRestarting is a graceful restart (prwatch daemon restart or
+	// SIGHUP). Clients reconnect; 0.1.1 clients treat it like "stopping".
+	ShutdownRestarting = "restarting"
 )
 
 // Hello is the daemon's first line.
