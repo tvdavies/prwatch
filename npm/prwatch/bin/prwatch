@@ -23,7 +23,7 @@ try {
 } catch {
   console.error(
     `prwatch: the optional dependency ${pkg} is not installed.\n` +
-      "Reinstall without --omit=optional / --no-optional, e.g. `npm i -g prwatch`.",
+      "Reinstall without --omit=optional / --no-optional, e.g. `npm i -g @tvdavies/prwatch`.",
   );
   process.exit(1);
 }

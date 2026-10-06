@@ -4,8 +4,8 @@
 //   node scripts/npm-packages.mjs <version> [dist-dir] [out-dir]
 //
 // Writes one directory per package to out-dir (default npm/dist): the four
-// platform packages, each holding one native binary, and the main `prwatch`
-// package, whose optionalDependencies pin them to the same version.
+// platform packages, each holding one native binary, and the main
+// `@tvdavies/prwatch` package (in out-dir/prwatch), whose optionalDependencies pin them to the same version.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,7 +37,7 @@ for (const b of binaries) {
   fs.writeFileSync(path.join(dir, "LICENSE"), licence);
   fs.writeFileSync(
     path.join(dir, "README.md"),
-    `# ${name}\n\nThe ${os}/${cpu} binary for [prwatch](https://github.com/tvdavies/prwatch). Install \`prwatch\` instead.\n`,
+    `# ${name}\n\nThe ${os}/${cpu} binary for [prwatch](https://github.com/tvdavies/prwatch). Install \`@tvdavies/prwatch\` instead.\n`,
   );
   const pkg = {
     name,
@@ -64,12 +64,15 @@ fs.cpSync(mainSrc, mainDir, { recursive: true });
 fs.copyFileSync(path.join(root, "LICENSE"), path.join(mainDir, "LICENSE"));
 fs.copyFileSync(path.join(root, "README.md"), path.join(mainDir, "README.md"));
 const main = JSON.parse(fs.readFileSync(path.join(mainSrc, "package.json"), "utf8"));
+if (main.name !== "@tvdavies/prwatch" || main.bin?.prwatch !== "bin/prwatch") {
+  throw new Error(`unexpected main package ${main.name} with bin ${JSON.stringify(main.bin)}`);
+}
 main.version = version;
 main.optionalDependencies = Object.fromEntries(Object.entries(optionalDependencies).sort());
 main.publishConfig = { access: "public" };
 fs.writeFileSync(path.join(mainDir, "package.json"), JSON.stringify(main, null, 2) + "\n");
 
-// Platform packages first: the main package depends on them.
+// Directory names, platform packages first: the main package depends on them.
 const order = [...Object.keys(optionalDependencies).sort().map((n) => `prwatch-${n.split("prwatch-")[1]}`), "prwatch"];
 fs.writeFileSync(path.join(outDir, "publish-order.txt"), order.join("\n") + "\n");
 console.log(`wrote ${order.length} packages for ${version} to ${path.relative(root, outDir)}`);

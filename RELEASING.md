@@ -18,13 +18,13 @@ The npm packages are:
 
 | Package | Contents |
 | --- | --- |
-| `prwatch` | launcher and postinstall; depends on the four below as optional dependencies |
+| `@tvdavies/prwatch` | launcher and postinstall, installing the `prwatch` command; depends on the four below as optional dependencies |
 | `@tvdavies/prwatch-linux-x64` | Linux x86-64 binary |
 | `@tvdavies/prwatch-linux-arm64` | Linux arm64 binary |
 | `@tvdavies/prwatch-darwin-x64` | macOS Intel binary |
 | `@tvdavies/prwatch-darwin-arm64` | macOS Apple silicon binary |
 
-The platform packages live under the `@tvdavies` scope, so nobody else can squat them. All five names were free on 6 October 2026.
+All five packages live under the `@tvdavies` scope, so nobody else can squat them. The main package was going to be the unscoped `prwatch`, but npm rejects that name as too similar to `watch`. The installed command is still `prwatch`.
 
 npm only lets you add a trusted publisher to a package that already exists. Since 3 September 2026, a new trust configuration only allows `npm stage publish` unless direct publish is enabled explicitly. The bootstrap script deals with both.
 
@@ -42,9 +42,11 @@ npm only lets you add a trusted publisher to a package that already exists. Sinc
    ```
 
    For each of the five packages, it:
-   - publishes a placeholder `0.0.0-bootstrap.0` under the `bootstrap` dist-tag;
-   - runs `npm trust github <package> --file release.yml --repo tvdavies/prwatch --allow-publish --yes`;
-   - deprecates the placeholder.
+   - publishes a placeholder `0.0.0-bootstrap.0` under the `bootstrap` dist-tag, unless the package already exists (`npm view <package> version` succeeds);
+   - runs `npm trust github <package> --file release.yml --repo tvdavies/prwatch --allow-publish --yes`, unless `npm trust list <package> --json` already shows `tvdavies/prwatch` and `release.yml`;
+   - deprecates the placeholder, unless it is already deprecated.
+
+   The script is safe to re-run: it skips anything that is already done. To check a package by hand, run `npm trust list <package>`.
 
    npm will ask for 2FA. In the browser prompt, tick the option that skips 2FA for the next five minutes so that the remaining packages go through.
 
@@ -93,9 +95,9 @@ Users then install with `gh extension install tvdavies/gh-prwatch` and run `gh p
 4. Check the results:
 
    ```sh
-   npm view prwatch version
-   npm view prwatch dist.attestations   # provenance
-   npm i -g prwatch && prwatch version && file -L "$(command -v prwatch)"   # should be a native binary
+   npm view @tvdavies/prwatch version
+   npm view @tvdavies/prwatch dist.attestations   # provenance
+   npm i -g @tvdavies/prwatch && prwatch version && file -L "$(command -v prwatch)"   # should be a native binary
    gh release view v0.1.0 --repo tvdavies/prwatch
    gh extension install tvdavies/gh-prwatch && gh prwatch version
    ```
