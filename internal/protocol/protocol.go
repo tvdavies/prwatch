@@ -149,6 +149,17 @@ type Info struct {
 	PRs       int       `json:"prs"`
 }
 
+// BinaryInfo is what `prwatch version --json` prints (0.1.3 and later).
+// Clients run it on a binary before starting a daemon from it, to check that
+// it speaks their protocol.
+type BinaryInfo struct {
+	Version  string `json:"version"`
+	Protocol int    `json:"protocol"`
+	OS       string `json:"os,omitempty"`
+	Arch     string `json:"arch,omitempty"`
+	Go       string `json:"go,omitempty"`
+}
+
 // Encode marshals v as one JSON line.
 func Encode(v any) ([]byte, error) {
 	b, err := json.Marshal(v)

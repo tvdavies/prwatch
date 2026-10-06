@@ -160,7 +160,8 @@ func Run(cfg Config) error {
 		ids:       loadIDs(paths.IDs(cfg.StateDir)),
 		heads:     map[string]github.ThreadHead{},
 	}
-	log.Info("daemon started", "pid", os.Getpid(), "version", cfg.Version, "socket", sock,
+	exe, _ := os.Executable()
+	log.Info("daemon started", "pid", os.Getpid(), "version", cfg.Version, "exe", exe, "socket", sock,
 		"idleGrace", cfg.IdleGrace, "fast", cfg.FastInterval, "slow", cfg.SlowInterval, "budgetShare", cfg.BudgetShare)
 	d.restoreRateState()
 
