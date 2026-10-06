@@ -97,7 +97,7 @@ Users then install with `gh extension install tvdavies/gh-prwatch` and run `gh p
    ```sh
    npm view @tvdavies/prwatch version
    npm view @tvdavies/prwatch dist.attestations   # provenance
-   npm i -g @tvdavies/prwatch && prwatch version && file -L "$(command -v prwatch)"   # should be a native binary
+   npm i -g @tvdavies/prwatch && prwatch daemon restart && prwatch version && file -L "$(command -v prwatch)"   # should be a native binary
    gh release view v0.1.0 --repo tvdavies/prwatch
    gh extension install tvdavies/gh-prwatch && gh prwatch version
    ```

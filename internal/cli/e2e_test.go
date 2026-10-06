@@ -35,6 +35,7 @@ type env struct {
 	dir   string
 	fake  *fakegh.Server
 	extra []string
+	bin   string // executable to run; the test binary when empty
 }
 
 func newEnv(t *testing.T, extra ...string) *env {
@@ -61,7 +62,11 @@ func newEnv(t *testing.T, extra ...string) *env {
 }
 
 func (e *env) cmd(args ...string) *exec.Cmd {
-	c := exec.Command(os.Args[0], args...)
+	bin := e.bin
+	if bin == "" {
+		bin = os.Args[0]
+	}
+	c := exec.Command(bin, args...)
 	c.Env = append(os.Environ(),
 		"PRWATCH_TEST_EXEC=1",
 		"PRWATCH_STATE_DIR="+e.dir,
@@ -165,7 +170,12 @@ func (p *proc) running() bool {
 }
 
 type listOut struct {
-	PRs []protocol.Watched `json:"prs"`
+	PRs    []protocol.Watched `json:"prs"`
+	Daemon *struct {
+		PID     int    `json:"pid"`
+		Version string `json:"version"`
+	} `json:"daemon"`
+	DaemonVersion *string `json:"daemonVersion"`
 }
 
 func (e *env) list() listOut {
