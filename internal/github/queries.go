@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -147,14 +148,7 @@ func (c *Client) Resolve(ctx context.Context, refs []prref.Ref) ([]Result, RateI
 		prPath := []string{repoAlias, prAlias}
 		raw := repo[prAlias]
 		if len(raw) == 0 || string(raw) == "null" {
-			e, ok := errorAt(resp.Errors, prPath)
-			if !ok {
-				e, ok = errorAt(resp.Errors, prPath[:1])
-			}
-			if !ok {
-				e, _ = errorAt(resp.Errors, nil)
-			}
-			res.Err = aliasError(ref, e)
+			res.Err = nullPRError(ref, resp.Errors, prPath, prPath[:1])
 			out = append(out, res)
 			continue
 		}
@@ -186,11 +180,7 @@ func (c *Client) Poll(ctx context.Context, targets []Target) ([]Result, RateInfo
 		res := Result{Ref: t.Ref, NodeID: t.NodeID}
 		raw := resp.Data[alias]
 		if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
-			e, ok := errorAt(resp.Errors, []string{alias})
-			if !ok {
-				e, _ = errorAt(resp.Errors, nil)
-			}
-			res.Err = aliasError(t.Ref, e)
+			res.Err = nullPRError(t.Ref, resp.Errors, []string{alias}, nil)
 			out = append(out, res)
 			continue
 		}
@@ -280,6 +270,36 @@ func aliasError(ref prref.Ref, e GQLError) error {
 		return &AuthError{Message: fmt.Sprintf("%s: %s", ref, e.Message)}
 	}
 	return &TransientError{Err: fmt.Errorf("%s: %s (%s)", ref, e.Message, e.Type)}
+}
+
+// nullPRError classifies a PR alias that came back null. It prefers an
+// error at the alias itself; then one beneath it, since GraphQL nulls the
+// nearest nullable parent when a non-null field fails but keeps the field's
+// own path; then one at parent (the repository, for Resolve); then one with
+// no path. An error beneath the alias says a field failed, not that the PR
+// is missing, so it is never classified as not found.
+func nullPRError(ref prref.Ref, errs []GQLError, alias, parent []string) error {
+	if e, ok := errorAt(errs, alias); ok {
+		return aliasError(ref, e)
+	}
+	for _, e := range errs {
+		if len(e.Path) > len(alias) && pathHasPrefix(e.Path, alias) {
+			e.Message = formatPath(e.Path[len(alias):]) + ": " + e.Message
+			err := aliasError(ref, e)
+			var nf *NotFoundError
+			if errors.As(err, &nf) {
+				err = &TransientError{Err: fmt.Errorf("%s: %s (%s)", ref, e.Message, e.Type)}
+			}
+			return err
+		}
+	}
+	if parent != nil {
+		if e, ok := errorAt(errs, parent); ok {
+			return aliasError(ref, e)
+		}
+	}
+	e, _ := errorAt(errs, nil)
+	return aliasError(ref, e)
 }
 
 // errorAt returns the first error whose path is exactly path. A nil path

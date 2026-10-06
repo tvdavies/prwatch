@@ -136,3 +136,18 @@ func TestReserveSurvivesRestart(t *testing.T) {
 		t.Fatalf("after restart: reserve until %s, want reset+1s", got)
 	}
 }
+
+func TestReserveWithoutKnownLimit(t *testing.T) {
+	g, now := newGov(t)
+	reset := now.Add(time.Hour)
+	// The first response was a secondary limit reporting 4 points left; no
+	// successful response has reported the limit.
+	g.OnRateLimit(&github.RateLimitError{Secondary: true, RetryAfter: time.Second, Remaining: 4, ResetAt: reset})
+	*now = now.Add(2 * time.Second)
+	if blocked, _ := g.Blocked(); blocked {
+		t.Fatal("retry-after should have passed")
+	}
+	if got := g.ReserveUntil(); !got.Equal(reset.Add(time.Second)) {
+		t.Fatalf("reserve until %s, want reset+1s", got)
+	}
+}

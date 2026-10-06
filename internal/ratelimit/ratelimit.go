@@ -158,12 +158,8 @@ func (g *Governor) allowedRoundsLocked(now time.Time) (float64, bool) {
 	if g.st.Remaining < 0 || !g.st.ResetAt.After(now) {
 		return 0, false
 	}
-	if g.st.Remaining == 0 {
-		return 0, true
-	}
-	if g.st.Limit == 0 {
-		return 0, false
-	}
+	// Remaining is -1 until a response reports it, so any other value is
+	// known, even if no successful response has reported the limit yet.
 	cost := g.st.RoundCost
 	if cost < 1 {
 		cost = 1

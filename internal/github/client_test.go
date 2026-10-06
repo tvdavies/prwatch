@@ -245,3 +245,47 @@ func TestResolveNestedErrorDoesNotLeakToSiblings(t *testing.T) {
 		}
 	}
 }
+
+func TestNullPRWithNestedErrorIsNotNotFound(t *testing.T) {
+	// A failing non-null field nulls the whole PR but the error keeps the
+	// field's path. That is a failure to read the PR, not a missing PR.
+	rate := `"rateLimit":{"cost":1,"limit":5000,"remaining":4000,"used":1000,"resetAt":"2026-10-06T13:00:00Z"}`
+	cl := serve(t, 200, nil, `{"data":{"p0":null,"p1":null,`+rate+`},
+"errors":[{"type":"INTERNAL","path":["p0","mergeable"],"message":"Something went wrong"}]}`)
+	res, _, err := cl.Poll(context.Background(), []Target{
+		{Ref: prref.Ref{Owner: "o", Repo: "r", Number: 1}, NodeID: "PR_1"},
+		{Ref: prref.Ref{Owner: "o", Repo: "r", Number: 2}, NodeID: "PR_2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var te *TransientError
+	var nf *NotFoundError
+	if !errors.As(res[0].Err, &te) || !strings.Contains(res[0].Err.Error(), "mergeable") {
+		t.Fatalf("p0: %T %v", res[0].Err, res[0].Err)
+	}
+	if !errors.As(res[1].Err, &nf) {
+		t.Fatalf("p1 must not inherit p0's error: %T %v", res[1].Err, res[1].Err)
+	}
+
+	cl = serve(t, 200, nil, `{"data":{"r0":{"q0":null,"q1":null},`+rate+`},
+"errors":[{"type":"FORBIDDEN","path":["r0","q0","commits"],"message":"Resource not accessible by integration"},
+{"type":"NOT_FOUND","path":["r0","q1","headRepository"],"message":"Could not resolve"}]}`)
+	res, _, err = cl.Resolve(context.Background(), []prref.Ref{{Owner: "o", Repo: "r", Number: 1}, {Owner: "o", Repo: "r", Number: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		var ae *AuthError
+		switch r.Ref.Number {
+		case 1:
+			if !errors.As(r.Err, &ae) {
+				t.Fatalf("q0: %T %v", r.Err, r.Err)
+			}
+		case 2:
+			if !errors.As(r.Err, &te) {
+				t.Fatalf("q1: a nested NOT_FOUND is not a missing PR: %T %v", r.Err, r.Err)
+			}
+		}
+	}
+}
