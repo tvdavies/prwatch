@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -54,7 +55,7 @@ Usage:
   prwatch list [--json]
   prwatch rate [--json]
   prwatch daemon status|stop|restart [--force]
-  prwatch version
+  prwatch version [--json]
 
 A <pr> is owner/repo#123, a GitHub PR URL, or 123 (or '#123') inside a
 checkout whose origin remote is on GitHub.
@@ -67,6 +68,7 @@ incomplete data).
 // Main runs the CLI and returns the process exit code.
 func Main(args []string, version string) int {
 	version = resolveVersion(version)
+	client.Version = version
 	if len(args) == 0 {
 		fmt.Fprint(Stderr, usage)
 		return ExitUsage
@@ -86,8 +88,7 @@ func Main(args []string, version string) int {
 	case "daemon":
 		return cmdDaemon(rest, version)
 	case "version", "--version", "-v":
-		fmt.Fprintf(Stdout, "prwatch %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
-		return ExitOK
+		return cmdVersion(rest, version)
 	case "__daemon":
 		cfg, err := daemon.ConfigFromEnv(version)
 		if err != nil {
@@ -105,6 +106,24 @@ func Main(args []string, version string) int {
 	}
 	fmt.Fprintf(Stderr, "prwatch: unknown command %q\n\n%s", cmd, usage)
 	return ExitUsage
+}
+
+// cmdVersion prints the version. With --json it also gives the protocol
+// version; clients run it on a binary before starting a daemon from it.
+func cmdVersion(args []string, version string) int {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "")
+	if _, err := parseFlags(fs, args); err != nil {
+		return flagError(fs, err, "Usage: prwatch version [--json]\n")
+	}
+	if *asJSON {
+		b, _ := json.Marshal(protocol.BinaryInfo{Version: version, Protocol: protocol.Version,
+			OS: runtime.GOOS, Arch: runtime.GOARCH, Go: runtime.Version()})
+		fmt.Fprintln(Stdout, string(b))
+		return ExitOK
+	}
+	fmt.Fprintf(Stdout, "prwatch %s (%s/%s, %s)\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return ExitOK
 }
 
 func resolveVersion(v string) string {
@@ -316,13 +335,40 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 		deadline = t.C
 	}
 	failures := 0
+	retry := retryFromEnv()
+	attempts := 0    // consecutive failures to start or reach a daemon
+	var outage error // set while those failures last
 	for {
 		conn, err := client.DialUntil(dir, true, deadlineAt)
 		if errors.Is(err, client.ErrDeadline) {
 			return 0, false
 		}
 		if err != nil {
-			return fail(err), true
+			// No binary to start, a failed spawn, or a daemon that dies at
+			// start-up (during an upgrade, say): keep the handler's state
+			// and try again, rather than lose the wait.
+			attempts++
+			if attempts >= retry.attempts {
+				return fail(fmt.Errorf("gave up after %d attempts to start or reach the daemon: %w", attempts, err)), true
+			}
+			if outage == nil {
+				until := fmt.Sprintf("up to %d attempts", retry.attempts)
+				if !deadlineAt.IsZero() {
+					until = fmt.Sprintf("until the timeout (%s left)", time.Until(deadlineAt).Round(time.Second))
+				}
+				fmt.Fprintf(Stderr, "prwatch: warning: %v; retrying with back-off, %s\n", err, until)
+			}
+			outage = err
+			pause := retry.delay(attempts)
+			if !deadlineAt.IsZero() {
+				pause = min(pause, max(time.Until(deadlineAt), 0))
+			}
+			time.Sleep(pause)
+			continue
+		}
+		if outage != nil {
+			fmt.Fprintf(Stderr, "prwatch: reconnected to daemon pid %d (version %s)\n", conn.Hello.PID, conn.Hello.Version)
+			outage, attempts = nil, 0
 		}
 		if err := conn.Send(req); err != nil {
 			conn.Close()
@@ -389,8 +435,45 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 				}
 			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		// Spread reconnecting clients out a little, so that most find the
+		// daemon the first one back started rather than each starting one.
+		time.Sleep(50*time.Millisecond + rand.N(100*time.Millisecond))
 	}
+}
+
+// retryPolicy bounds how a wait or events stream retries when no daemon can
+// be started or reached.
+type retryPolicy struct {
+	attempts int           // give up (exit 1) after this many in a row
+	base     time.Duration // first back-off
+	max      time.Duration // back-off cap
+}
+
+// retryFromEnv returns the default policy: back-off from 250ms doubling to
+// 10s, giving up after 20 attempts in a row (about 2.5 minutes) unless the
+// wait's deadline comes first. PRWATCH_RETRY_ATTEMPTS and PRWATCH_RETRY_MAX
+// override the count and the cap, for tests.
+func retryFromEnv() retryPolicy {
+	p := retryPolicy{attempts: 20, base: 250 * time.Millisecond, max: 10 * time.Second}
+	if n, err := strconv.Atoi(os.Getenv("PRWATCH_RETRY_ATTEMPTS")); err == nil && n > 0 {
+		p.attempts = n
+	}
+	if d, err := time.ParseDuration(os.Getenv("PRWATCH_RETRY_MAX")); err == nil && d > 0 {
+		p.max = d
+		p.base = min(p.base, d)
+	}
+	return p
+}
+
+// delay is the pause after the nth failure in a row: exponential, capped,
+// with jitter over its upper half so retrying clients drift apart.
+func (p retryPolicy) delay(n int) time.Duration {
+	d := p.base
+	for i := 1; i < n && d < p.max; i++ {
+		d *= 2
+	}
+	d = min(d, p.max)
+	return d/2 + rand.N(d/2+1)
 }
 
 const statusHelp = `Usage: prwatch status <pr...> [--json]

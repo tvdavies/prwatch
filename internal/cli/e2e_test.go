@@ -73,6 +73,7 @@ func (e *env) cmd(args ...string) *exec.Cmd {
 		"PRWATCH_GRAPHQL_URL="+e.fake.URL,
 		"GH_TOKEN=fake-token",
 		"GITHUB_TOKEN=",
+		"PRWATCH_BIN=",
 		"PRWATCH_IDLE_GRACE=1s",
 		"PRWATCH_POLL_FAST=300ms",
 		"PRWATCH_POLL_SLOW=300ms",

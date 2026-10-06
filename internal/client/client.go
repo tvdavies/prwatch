@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -36,8 +37,22 @@ func Dial(stateDir string, spawn bool) (*Conn, error) {
 	return DialUntil(stateDir, spawn, time.Time{})
 }
 
+// SpawnError is returned by DialUntil when it could not start a daemon at
+// all: no usable binary was found, or starting it failed.
+type SpawnError struct{ Err error }
+
+func (e *SpawnError) Error() string { return "could not start a daemon: " + e.Err.Error() }
+func (e *SpawnError) Unwrap() error { return e.Err }
+
 // DialUntil is Dial with a caller deadline (zero for none). Connecting gives
 // up after 10s regardless.
+//
+// When several clients find no daemon at once, each starts one; the daemon
+// that takes the lock and binds the socket wins, the others exit, and every
+// client connects to the winner. A client starts another daemon only once
+// the one it started has exited without anyone listening (it lost the race
+// to a daemon that was still shutting down, or it died at start-up), at
+// growing intervals, so a crowd of reconnecting clients cannot stampede.
 func DialUntil(stateDir string, spawn bool, callerDeadline time.Time) (*Conn, error) {
 	sock := paths.Socket(stateDir)
 	deadline := time.Now().Add(10 * time.Second)
@@ -46,6 +61,8 @@ func DialUntil(stateDir string, spawn bool, callerDeadline time.Time) (*Conn, er
 	}
 	delay := 10 * time.Millisecond
 	var lastSpawn time.Time
+	spawnGap := 500 * time.Millisecond
+	var child <-chan struct{} // closed when the daemon we started exits
 	var lastErr error
 	for {
 		c, err := tryDial(sock, deadline)
@@ -65,12 +82,17 @@ func DialUntil(stateDir string, spawn bool, callerDeadline time.Time) (*Conn, er
 			}
 			return nil, fmt.Errorf("could not reach the prwatch daemon (see %s): %w", paths.Log(stateDir), lastErr)
 		}
-		// Spawn at most every 500ms: a daemon that lost the start-up race
-		// exits at once, and one that is shutting down needs a moment.
-		if time.Since(lastSpawn) > 500*time.Millisecond {
-			if err := Spawn(stateDir); err != nil {
-				return nil, fmt.Errorf("start daemon: %w", err)
+		// While the daemon we started is alive it is either starting up or
+		// waiting to see whether another one wins, so don't start more.
+		if exited(child) && time.Since(lastSpawn) > spawnGap {
+			if !lastSpawn.IsZero() {
+				spawnGap = min(spawnGap*2, 4*time.Second)
 			}
+			done, err := Spawn(stateDir)
+			if err != nil {
+				return nil, &SpawnError{err}
+			}
+			child = done
 			lastSpawn = time.Now()
 		}
 		time.Sleep(delay)
@@ -106,26 +128,47 @@ func isNoListener(err error) bool {
 	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
-// Spawn starts a detached daemon: the same executable with the hidden
-// __daemon subcommand, in a new session, with output to the log file.
-func Spawn(stateDir string) error {
-	exe, err := Executable()
-	if err != nil {
-		return err
+func exited(child <-chan struct{}) bool {
+	if child == nil {
+		return true
 	}
+	select {
+	case <-child:
+		return true
+	default:
+		return false
+	}
+}
+
+// Spawn starts a detached daemon from the binary ResolveExecutable picks,
+// with the hidden __daemon subcommand, in a new session, with output to the
+// log file. It logs the binary it chose, and why it skipped any before it,
+// to the daemon log. The returned channel is closed when the daemon exits.
+func Spawn(stateDir string) (<-chan struct{}, error) {
 	logPath := paths.Log(stateDir)
 	rotateLog(logPath)
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer logf.Close()
+	log := slog.New(slog.NewTextHandler(logf, nil))
+	bin, err := ResolveExecutable()
+	if err != nil {
+		log.Warn("cannot start daemon", "client", os.Getpid(), "err", err)
+		return nil, err
+	}
+	attrs := []any{"exe", bin.Path, "via", bin.Via, "version", bin.Version, "client", os.Getpid()}
+	if len(bin.Skipped) > 0 {
+		attrs = append(attrs, "skipped", strings.Join(bin.Skipped, "; "))
+	}
+	log.Info("starting daemon", attrs...)
 	devnull, err := os.Open(os.DevNull)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer devnull.Close()
-	cmd := exec.Command(exe, "__daemon")
+	cmd := exec.Command(bin.Path, "__daemon")
 	cmd.Stdin = devnull
 	cmd.Stdout = logf
 	cmd.Stderr = logf
@@ -133,44 +176,14 @@ func Spawn(stateDir string) error {
 	cmd.Env = append(os.Environ(), "PRWATCH_STATE_DIR="+stateDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		return err
+		log.Warn("cannot start daemon", "exe", bin.Path, "client", os.Getpid(), "err", err)
+		return nil, err
 	}
 	// Reap the child if it exits while we are still running (for example
 	// when it lost the start-up race).
-	go func() { _ = cmd.Wait() }()
-	return nil
-}
-
-// deletedSuffix is what Linux appends to /proc/self/exe once the running
-// binary has been unlinked, as npm does when it upgrades the package.
-const deletedSuffix = " (deleted)"
-
-// Executable returns the path to start a daemon from: the path this process
-// was started from, which after an upgrade holds the new binary.
-//
-// On Linux, os.Executable reads /proc/self/exe, which gains a " (deleted)"
-// suffix once the running binary has been replaced. Go strips the suffix
-// itself; it is stripped here too so that the result never depends on that.
-// On macOS, os.Executable returns the path the process was started from,
-// which likewise now holds the new binary. If nothing is at that path any
-// more (the package was moved or removed), it falls back to prwatch on PATH.
-func Executable() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return resolveExecutable(exe, exec.LookPath)
-}
-
-func resolveExecutable(exe string, lookPath func(string) (string, error)) (string, error) {
-	exe = strings.TrimSuffix(exe, deletedSuffix)
-	if fi, err := os.Stat(exe); err == nil && fi.Mode().IsRegular() {
-		return exe, nil
-	}
-	if p, err := lookPath("prwatch"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("the prwatch executable %s is gone and prwatch is not on PATH", exe)
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	return done, nil
 }
 
 func rotateLog(path string) {

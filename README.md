@@ -44,7 +44,7 @@ npm i -g @tvdavies/prwatch@latest && prwatch daemon restart
 Installing a new version replaces the binary on disk, but a daemon that is already running carries on with the old one. `prwatch daemon restart` hands over to the new version without interrupting anyone:
 
 - the old daemon stops polling and tells every connected `wait` and `events` client to reconnect;
-- the first to reconnect starts a new daemon from the binary now on disk. If no waiter gets there first, `restart` starts it itself;
+- the first to reconnect starts a new daemon from the binary now installed (see [which binary](#which-binary-the-new-daemon-runs)). If no waiter gets there first, `restart` starts it itself;
 - `restart` prints the old and new pid and version once the new daemon is up:
 
   ```
@@ -65,6 +65,29 @@ What it doesn't do:
 - The new daemon takes its environment, including the token and `PRWATCH_*` settings, from whichever process starts it: a reconnecting waiter or `restart`.
 - If nothing is running, `restart` says so and exits 0. The next `wait` or `events` starts the new version anyway.
 
+### Which binary the new daemon runs
+
+A daemon is started by whichever client finds none running, so after an upgrade it is often an old waiter that starts the new one, and that waiter's own binary may be gone: npm doesn't overwrite the binary in place, it renames the whole package directory (to something like `node_modules/@tvdavies/.prwatch-Qm7hs3aq`), writes the new version in its place and deletes the renamed one. So a client picks the binary to start the daemon from by trying, in order:
+
+1. **The binary it is running from**, if it is still there. A binary replaced in place counts, since the path then holds the new version; on Linux the ` (deleted)` that `/proc/self/exe` gains is ignored. A path inside a package directory npm has renamed is skipped, because npm is about to delete it.
+2. **`PRWATCH_BIN`**, if set: a path to the `prwatch` binary (or a name to look up on `PATH`).
+3. **`prwatch` on `PATH`**.
+4. **The npm launcher**: if the running binary came from the npm package, `node_modules/@tvdavies/prwatch/bin/prwatch` in the same `node_modules`, which is where npm put the new version.
+
+Before using a candidate other than the unchanged binary it is running, the client runs `<candidate> version --json` and skips the candidate unless it is executable and speaks the same protocol version. The daemon log (`daemon.log`) records the choice, and why earlier candidates were skipped:
+
+```
+level=INFO msg="starting daemon" exe=/usr/local/lib/node_modules/@tvdavies/prwatch/bin/prwatch via=npm version=0.1.3 client=41291 skipped="executable /usr/local/lib/node_modules/@tvdavies/.prwatch-Qm7hs3aq/bin/prwatch: npm is replacing this package; PATH: prwatch not found"
+```
+
+Set `PRWATCH_BIN` when none of the others would find the right binary, for example when `prwatch` isn't on the `PATH` of the processes that run your waiters and you install it some other way than npm.
+
+If no daemon can be started (no candidate works, starting it fails, or it dies at start-up), clients don't give up. `wait` and `events` print one warning to stderr, keep their `--for` condition, `--since` token and printed state, and retry with back-off (doubling from 250ms to 10s). Once a daemon is up they print `reconnected to daemon pid … (version …)` and carry on, so nothing that changed in the meantime is missed. A `wait` still times out at its `--timeout` (exit 124); without a deadline, a client gives up with exit 1 after 20 failed attempts in a row, about two minutes. Retrying clients don't stampede: each starts at most one daemon at a time, the one that binds the socket wins, and the rest connect to it.
+
+These rules apply to clients from 0.1.3 on. Waiters from 0.1.2 try only their own path and then `PATH`, so run `prwatch daemon restart` after upgrading rather than relying on them.
+
+### Version skew
+
 `prwatch list`, `prwatch rate` and `prwatch daemon status` warn when the daemon's version differs from the `prwatch` you ran, and suggest `prwatch daemon restart`. `list --json` includes `daemonVersion` and `clientVersion`.
 
 **Upgrading from 0.1.1 or earlier.** Those daemons don't know how to restart gracefully. `prwatch daemon restart` says so and leaves them alone: if it stopped them, their waiters would exit with `daemon was stopped`. Either let the old daemon exit once nothing is waiting (the next `wait` or `events` then starts the new version), or run `prwatch daemon restart --force` to stop it now. If nothing is waiting on it, `restart` stops it without `--force`. Waiters from 0.1.1 do survive a restart of a 0.1.2 or later daemon, but a 0.1.1 `events` stream prints one repeated `initial` line per PR when it reconnects.
@@ -84,7 +107,7 @@ A `<pr>` can be:
 | `prwatch list [--json]` | Show what the daemon is watching, who is waiting and the budget. Never starts or keeps alive the daemon. |
 | `prwatch rate [--json]` | Show the remaining budget, last cost, poll interval and any back-off. |
 | `prwatch daemon status` / `stop` / `restart [--force]` | Inspect, stop or [restart](#upgrading) the daemon. |
-| `prwatch version` | Print the version. |
+| `prwatch version [--json]` | Print the version. `--json` prints `{"version", "protocol", "os", "arch", "go"}`. |
 
 ### `--for` conditions
 
@@ -193,7 +216,7 @@ A PR on which nothing has been edited keeps the same token as in 0.1.0.
 
 ## How the daemon works
 
-- **Start-up:** `wait`, `events` and `status` connect to a per-user unix socket, `prwatch.sock`. It lives in `$XDG_RUNTIME_DIR/prwatch`, or `~/Library/Caches/prwatch` on macOS, or `~/.cache/prwatch`. The directory is created with mode 0700. If nothing is listening, `wait` and `events` start the daemon: the same executable with a hidden `__daemon` subcommand, in a new session, logging to `daemon.log` in that directory.
+- **Start-up:** `wait`, `events` and `status` connect to a per-user unix socket, `prwatch.sock`. It lives in `$XDG_RUNTIME_DIR/prwatch`, or `~/Library/Caches/prwatch` on macOS, or `~/.cache/prwatch`. The directory is created with mode 0700. If nothing is listening, `wait` and `events` start the daemon: normally the same executable (see [which binary](#which-binary-the-new-daemon-runs)) with a hidden `__daemon` subcommand, in a new session, logging to `daemon.log` in that directory.
 - **One daemon:** the daemon holds an exclusive `flock` on `daemon.lock` for its whole life. Clients that start at the same moment therefore end up with exactly one daemon, and a stale socket left by a crash is replaced safely.
 - **Interest:** each open connection registers interest in its PRs, using a small JSON-lines protocol. When a waiter exits or is killed, its interest goes with it.
 - **Polling:** the daemon polls the union of PRs that open connections care about. It never sends requests concurrently:
@@ -231,6 +254,7 @@ Configuration is by environment variable, read when the daemon starts:
 | `PRWATCH_STATE_DIR` | see above | socket, lock, log, `rate.json` and `ids.json` |
 | `PRWATCH_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 | `PRWATCH_POLL_FAST` / `PRWATCH_POLL_SLOW` | `10s` / `60s` | poll intervals (minimum 5s) |
+| `PRWATCH_BIN` | unset | binary for clients to start the daemon from when their own has gone; see [Upgrading](#which-binary-the-new-daemon-runs) |
 
 The daemon inherits its environment, including the token, from whichever client started it. Run `prwatch daemon restart` after changing configuration; the new daemon takes its environment from whichever process starts it.
 

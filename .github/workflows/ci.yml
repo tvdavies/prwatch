@@ -29,6 +29,10 @@ jobs:
         run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 ./...
       - name: test
         run: go test -race -count=1 ./...
+      # Also part of the run above; repeated verbosely so the npm upgrade
+      # handover is visible on each OS.
+      - name: npm upgrade handover
+        run: go test -race -count=1 -v -run 'TestNpmUpgrade|TestRespawn|TestRestartNoStampede' ./internal/cli
       - name: static build
         env:
           CGO_ENABLED: "0"
