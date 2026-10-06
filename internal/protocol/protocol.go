@@ -58,10 +58,11 @@ const (
 
 // Error codes.
 const (
-	CodeNotFound   = "not_found"
-	CodeAuth       = "auth"
-	CodeBadRequest = "bad_request"
-	CodeInternal   = "internal"
+	CodeNotFound    = "not_found"
+	CodeAuth        = "auth"
+	CodeBadRequest  = "bad_request"
+	CodeRateLimited = "rate_limited"
+	CodeInternal    = "internal"
 )
 
 // Message is one daemon-to-client line.

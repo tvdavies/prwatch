@@ -42,6 +42,7 @@ type Server struct {
 	heads     map[string]github.ThreadHead
 	log       []Request
 	inject    []Response
+	delay     time.Duration
 	limit     int
 	remaining int
 	cost      int
@@ -136,6 +137,13 @@ func (s *Server) SetBudget(limit, remaining int) {
 	s.limit, s.remaining = limit, remaining
 }
 
+// SetDelay delays every response by d.
+func (s *Server) SetDelay(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delay = d
+}
+
 // SetCost sets the cost reported per request.
 func (s *Server) SetCost(c int) {
 	s.mu.Lock()
@@ -163,6 +171,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
 		return
+	}
+	s.mu.Lock()
+	delay := s.delay
+	s.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

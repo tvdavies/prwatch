@@ -19,6 +19,9 @@ import (
 // ErrNoDaemon is returned by Dial with spawn=false when no daemon is running.
 var ErrNoDaemon = errors.New("no prwatch daemon is running")
 
+// ErrDeadline is returned by DialUntil when the caller's deadline passes.
+var ErrDeadline = errors.New("deadline reached while connecting to the daemon")
+
 // Conn is a connection to the daemon.
 type Conn struct {
 	c     net.Conn
@@ -29,13 +32,22 @@ type Conn struct {
 // Dial connects to the daemon for stateDir. With spawn, it starts a
 // detached daemon when none is listening and retries with a short back-off.
 func Dial(stateDir string, spawn bool) (*Conn, error) {
+	return DialUntil(stateDir, spawn, time.Time{})
+}
+
+// DialUntil is Dial with a caller deadline (zero for none). Connecting gives
+// up after 10s regardless.
+func DialUntil(stateDir string, spawn bool, callerDeadline time.Time) (*Conn, error) {
 	sock := paths.Socket(stateDir)
 	deadline := time.Now().Add(10 * time.Second)
+	if !callerDeadline.IsZero() && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
 	delay := 10 * time.Millisecond
 	var lastSpawn time.Time
 	var lastErr error
 	for {
-		c, err := tryDial(sock)
+		c, err := tryDial(sock, deadline)
 		if err == nil {
 			return c, nil
 		}
@@ -47,6 +59,9 @@ func Dial(stateDir string, spawn bool) (*Conn, error) {
 			return nil, err
 		}
 		if time.Now().After(deadline) {
+			if deadline.Equal(callerDeadline) {
+				return nil, ErrDeadline
+			}
 			return nil, fmt.Errorf("could not reach the prwatch daemon (see %s): %w", paths.Log(stateDir), lastErr)
 		}
 		// Spawn at most every 500ms: a daemon that lost the start-up race
@@ -62,13 +77,17 @@ func Dial(stateDir string, spawn bool) (*Conn, error) {
 	}
 }
 
-func tryDial(sock string) (*Conn, error) {
+func tryDial(sock string, deadline time.Time) (*Conn, error) {
 	c, err := net.DialTimeout("unix", sock, time.Second)
 	if err != nil {
 		return nil, err
 	}
 	conn := &Conn{c: c, r: bufio.NewReaderSize(c, 64<<10)}
-	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	helloBy := time.Now().Add(5 * time.Second)
+	if !deadline.IsZero() && deadline.Before(helloBy) {
+		helloBy = deadline
+	}
+	_ = c.SetReadDeadline(helloBy)
 	line, err := conn.r.ReadBytes('\n')
 	if err != nil {
 		c.Close()
@@ -150,6 +169,9 @@ func (c *Conn) Recv() (protocol.Message, error) {
 	}
 	return m, nil
 }
+
+// SetReadDeadline bounds subsequent Recv calls.
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.c.SetReadDeadline(t) }
 
 // Close closes the connection, dropping any interest it registered.
 func (c *Conn) Close() error { return c.c.Close() }

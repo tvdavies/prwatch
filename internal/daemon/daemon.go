@@ -13,12 +13,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -54,14 +56,16 @@ type sub struct {
 
 // Daemon is the running poller and socket server.
 type Daemon struct {
-	cfg  Config
-	log  *slog.Logger
-	gh   *github.Client
-	gov  *ratelimit.Governor
-	ln   *net.UnixListener
-	done chan struct{}
-	kick chan struct{}
-	wg   sync.WaitGroup
+	cfg    Config
+	log    *slog.Logger
+	gh     *github.Client
+	gov    *ratelimit.Governor
+	ln     *net.UnixListener
+	ctx    context.Context // cancelled at shutdown, aborting in-flight requests
+	cancel context.CancelFunc
+	done   chan struct{}
+	kick   chan struct{}
+	wg     sync.WaitGroup
 
 	mu           sync.Mutex
 	watches      map[string]*watch
@@ -112,7 +116,10 @@ func Run(cfg Config) error {
 	gov := ratelimit.New(paths.Rate(cfg.StateDir))
 	gov.Share = cfg.BudgetShare
 	gov.MinBackoff = cfg.MinBackoff
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &Daemon{
+		ctx:       ctx,
+		cancel:    cancel,
 		cfg:       cfg,
 		log:       log,
 		gh:        github.NewClient(cfg.GraphQLURL, "prwatch/"+cfg.Version, &github.TokenSource{}),
@@ -217,16 +224,29 @@ func (d *Daemon) acceptLoop() {
 // explicit stop, which clients report rather than reconnecting after.
 func (d *Daemon) shutdown(stop bool) {
 	d.mu.Lock()
+	ok := d.beginShutdownLocked(stop)
+	d.mu.Unlock()
+	if ok {
+		d.finishShutdown()
+	}
+}
+
+// beginShutdownLocked commits to shutting down; from here register refuses
+// new interest, so clients reconnect to a fresh daemon.
+func (d *Daemon) beginShutdownLocked(stop bool) bool {
 	if d.shuttingDown {
-		d.mu.Unlock()
-		return
+		return false
 	}
 	d.shuttingDown = true
 	d.stopped = stop
 	if d.idleTimer != nil {
 		d.idleTimer.Stop()
 	}
-	d.mu.Unlock()
+	return true
+}
+
+func (d *Daemon) finishShutdown() {
+	d.cancel()
 	// Closing the listener unlinks the socket file.
 	d.ln.Close()
 	close(d.done)
@@ -240,13 +260,12 @@ func (d *Daemon) startIdleTimerLocked() {
 	gen := d.idleGen
 	d.idleTimer = time.AfterFunc(d.cfg.IdleGrace, func() {
 		d.mu.Lock()
-		if gen != d.idleGen || d.active > 0 || d.shuttingDown {
-			d.mu.Unlock()
-			return
-		}
+		ok := gen == d.idleGen && d.active == 0 && d.beginShutdownLocked(false)
 		d.mu.Unlock()
-		d.log.Info("idle grace elapsed with no waiters; exiting", "grace", d.cfg.IdleGrace)
-		d.shutdown(false)
+		if ok {
+			d.log.Info("idle grace elapsed with no waiters; exiting", "grace", d.cfg.IdleGrace)
+			d.finishShutdown()
+		}
 	})
 }
 
@@ -330,7 +349,11 @@ func (d *Daemon) serveSubscription(conn net.Conn, r *bufio.Reader, w connWriter,
 		all:       len(refs) == 0,
 		keepAlive: true,
 		got:       map[string]bool{},
-		out:       make(chan protocol.Message, 256),
+		// Sized so that initial deliveries never overflow.
+		out: make(chan protocol.Message, 64+4*len(refs)),
+	}
+	if len(refs) == 0 {
+		s.out = make(chan protocol.Message, 1024)
 	}
 	if s.op == protocol.OpEvents {
 		s.forCond = "events"
@@ -348,7 +371,10 @@ func (d *Daemon) serveSubscription(conn net.Conn, r *bufio.Reader, w connWriter,
 		_, _ = io.Copy(io.Discard, r)
 		close(gone)
 	}()
-	pending := len(refs)
+	pending := map[string]bool{}
+	for _, ref := range refs {
+		pending[ref.Key()] = true
+	}
 	for {
 		select {
 		case m := <-s.out:
@@ -356,8 +382,11 @@ func (d *Daemon) serveSubscription(conn net.Conn, r *bufio.Reader, w connWriter,
 				return
 			}
 			if s.op == protocol.OpStatus && (m.Type == protocol.TypeSnapshot || m.Type == protocol.TypeError) {
-				pending--
-				if pending == 0 {
+				if m.PR == "" { // a daemon-wide error ends the request
+					return
+				}
+				delete(pending, strings.ToLower(m.PR))
+				if len(pending) == 0 {
 					_ = w.send(protocol.Message{Type: protocol.TypeEnd})
 					return
 				}
@@ -405,6 +434,11 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 		s.deliver(d.log, protocol.Message{Type: protocol.TypeError, Code: protocol.CodeAuth, Message: d.authErr})
 		return true
 	}
+	blockedUntil := d.gov.BackoffUntil()
+	if d.transientEnd.After(blockedUntil) {
+		blockedUntil = d.transientEnd
+	}
+	blocked := blockedUntil.After(now)
 	needKick := false
 	for _, ref := range refs {
 		key := ref.Key()
@@ -420,7 +454,19 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 		s.keys = append(s.keys, key)
 		if w.snap != nil && now.Sub(w.lastFetched) < d.interval {
 			s.got[key] = true
-			s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.snap.PR, Snapshot: w.snap, Changes: []string{"initial"}})
+			s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: w.snap, Changes: []string{"initial"}})
+			continue
+		}
+		if s.op == protocol.OpStatus && blocked {
+			// status is one-shot: during back-off serve what we have
+			// rather than block until GitHub can be asked again.
+			s.got[key] = true
+			if w.snap != nil {
+				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: w.snap, Changes: []string{"initial"}})
+			} else {
+				s.deliver(d.log, protocol.Message{Type: protocol.TypeError, PR: w.ref.String(), Code: protocol.CodeRateLimited,
+					Message: fmt.Sprintf("%s: not cached and requests are backed off until %s", w.ref, blockedUntil.Local().Format(time.Kitchen))})
+			}
 			continue
 		}
 		if d.pendingSince.IsZero() {
@@ -432,7 +478,7 @@ func (d *Daemon) register(s *sub, refs []prref.Ref) bool {
 	if s.all {
 		for _, w := range d.watches {
 			if len(w.subs) > 0 && w.snap != nil {
-				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.snap.PR, Snapshot: w.snap, Changes: []string{"initial"}})
+				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: w.snap, Changes: []string{"initial"}})
 			}
 		}
 	}
@@ -506,11 +552,17 @@ func (d *Daemon) nextWakeLocked() (time.Time, bool) {
 		return time.Time{}, false
 	}
 	d.interval = d.gov.Interval(d.baseIntervalLocked(active))
+	// Every request, scheduled or on demand, is spaced by at least the
+	// budget-derived gap, so new interest cannot outspend the budget share.
+	gap := max(d.cfg.MinGap, d.gov.Interval(0))
 	at := d.lastRound.Add(d.interval)
+	if g := d.lastRequest.Add(d.gov.Interval(0)); g.After(at) {
+		at = g
+	}
 	for _, w := range active {
 		if w.nodeID == "" || w.needsRefresh {
 			p := d.pendingSince.Add(d.cfg.Debounce)
-			if g := d.lastRequest.Add(d.cfg.MinGap); g.After(p) {
+			if g := d.lastRequest.Add(gap); g.After(p) {
 				p = g
 			}
 			if p.Before(at) {
@@ -581,8 +633,17 @@ func (d *Daemon) round() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(d.ctx, 60*time.Second)
 	defer cancel()
+	// Checked before every request: a response in this round may have
+	// exhausted the budget, or the daemon may be shutting down.
+	allowed := func() bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		blocked, _ := d.gov.Blocked()
+		return !blocked
+	}
 	var (
 		results  []github.Result
 		requests int
@@ -590,6 +651,9 @@ func (d *Daemon) round() {
 		failed   bool
 	)
 	send := func(f func() ([]github.Result, github.RateInfo, error)) bool {
+		if !allowed() {
+			return false
+		}
 		res, rate, err := f()
 		requests++
 		d.mu.Lock()
@@ -628,6 +692,9 @@ func (d *Daemon) round() {
 	d.mu.Unlock()
 	if len(missing) > 0 && !failed {
 		for _, chunk := range chunks(missing, 100) {
+			if !allowed() {
+				break
+			}
 			heads, rate, err := d.gh.ThreadHeads(ctx, chunk)
 			requests++
 			d.mu.Lock()
@@ -686,6 +753,8 @@ func (d *Daemon) handleError(err error) {
 	var rl *github.RateLimitError
 	var ae *github.AuthError
 	switch {
+	case d.ctx.Err() != nil:
+		return // shutting down
 	case errors.As(err, &rl):
 		until := d.gov.OnRateLimit(rl)
 		d.log.Warn("rate limited; backing off", "secondary", rl.Secondary, "retryAfter", rl.RetryAfter,
@@ -726,11 +795,23 @@ func (d *Daemon) apply(results []github.Result) bool {
 		if w == nil {
 			continue
 		}
+		var te *github.TransientError
+		if errors.As(r.Err, &te) {
+			// Leave the watch in place; the next round retries it.
+			d.log.Warn("PR fetch failed; will retry", "pr", r.Ref.String(), "err", r.Err)
+			w.needsRefresh = false
+			continue
+		}
 		if r.Err != nil {
-			d.log.Info("PR not found", "pr", r.Ref.String(), "err", r.Err)
+			code := protocol.CodeNotFound
+			var ae *github.AuthError
+			if errors.As(r.Err, &ae) {
+				code = protocol.CodeAuth
+			}
+			d.log.Info("PR unavailable", "pr", r.Ref.String(), "code", code, "err", r.Err)
 			for s := range w.subs {
 				s.got[key] = true
-				s.deliver(d.log, protocol.Message{Type: protocol.TypeError, PR: r.Ref.String(), Code: protocol.CodeNotFound, Message: r.Err.Error()})
+				s.deliver(d.log, protocol.Message{Type: protocol.TypeError, PR: r.Ref.String(), Code: code, Message: r.Err.Error()})
 			}
 			delete(d.watches, key)
 			if _, ok := d.ids[key]; ok {
@@ -760,15 +841,15 @@ func (d *Daemon) apply(results []github.Result) bool {
 			switch {
 			case !s.got[key]:
 				s.got[key] = true
-				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: cur.PR, Snapshot: cur, Changes: []string{"initial"}})
+				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: cur, Changes: []string{"initial"}})
 			case changed:
-				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: cur.PR, Snapshot: cur, Changes: changes})
+				s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: cur, Changes: changes})
 			}
 		}
 		if changed {
 			for s := range d.subs {
 				if s.all {
-					s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: cur.PR, Snapshot: cur, Changes: changes})
+					s.deliver(d.log, protocol.Message{Type: protocol.TypeSnapshot, PR: w.ref.String(), Snapshot: cur, Changes: changes})
 				}
 			}
 		}

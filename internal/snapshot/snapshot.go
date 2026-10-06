@@ -64,9 +64,12 @@ type Review struct {
 
 // Threads summarises review threads.
 type Threads struct {
-	Total      int      `json:"total"`
-	Unresolved int      `json:"unresolved"`
-	Items      []Thread `json:"items"`
+	Total      int `json:"total"`
+	Unresolved int `json:"unresolved"`
+	// Truncated is true when the PR has more threads than were fetched
+	// (100), so Unresolved may be an undercount.
+	Truncated bool     `json:"truncated"`
+	Items     []Thread `json:"items"`
 }
 
 // Thread is one unresolved review thread.
@@ -216,7 +219,7 @@ func Ready(s *Snapshot) bool {
 	if s.State != "OPEN" || s.IsDraft {
 		return false
 	}
-	if !Approved(s) || !Green(s) || s.Threads.Unresolved > 0 || s.Mergeable != "MERGEABLE" {
+	if !Approved(s) || !Green(s) || s.Threads.Unresolved > 0 || s.Threads.Truncated || s.Mergeable != "MERGEABLE" {
 		return false
 	}
 	switch s.MergeStateStatus {

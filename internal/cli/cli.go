@@ -259,11 +259,9 @@ func cmdWait(args []string) int {
 		return fail(err)
 	}
 
-	var deadline <-chan time.Time
+	var deadline time.Time
 	if timeout.d > 0 {
-		t := time.NewTimer(timeout.d)
-		defer t.Stop()
-		deadline = t.C
+		deadline = time.Now().Add(timeout.d)
 	}
 	var last *snapshot.Snapshot
 	print := func(s *snapshot.Snapshot) {
@@ -299,11 +297,21 @@ func cmdWait(args []string) int {
 
 // stream runs a subscription, reconnecting if the daemon goes away, and
 // feeds snapshot messages to handle until it reports done. It returns
-// done=false on deadline.
-func stream(dir string, req protocol.Request, deadline <-chan time.Time, handle func(protocol.Message) (int, bool)) (int, bool) {
+// done=false when the deadline (zero for none) passes, including while
+// connecting.
+func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(protocol.Message) (int, bool)) (int, bool) {
+	var deadline <-chan time.Time
+	if !deadlineAt.IsZero() {
+		t := time.NewTimer(time.Until(deadlineAt))
+		defer t.Stop()
+		deadline = t.C
+	}
 	failures := 0
 	for {
-		conn, err := client.Dial(dir, true)
+		conn, err := client.DialUntil(dir, true, deadlineAt)
+		if errors.Is(err, client.ErrDeadline) {
+			return 0, false
+		}
 		if err != nil {
 			return fail(err), true
 		}
@@ -456,6 +464,8 @@ func statusViaDaemon(dir string, refs []prref.Ref) (map[string]statusResult, err
 	if err := conn.Send(protocol.Request{Op: protocol.OpStatus, PRs: prs}); err != nil {
 		return nil, err
 	}
+	// The daemon answers from cache, or after one on-demand fetch.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 	out := map[string]statusResult{}
 	for {
 		m, err := conn.Recv()
@@ -498,8 +508,15 @@ func (e *codedError) Error() string { return e.msg }
 
 func statusDirect(dir string, refs []prref.Ref, version string) (map[string]statusResult, error) {
 	gov := ratelimit.New(paths.Rate(dir))
-	if blocked, until := gov.Blocked(); blocked {
-		return nil, fmt.Errorf("rate-limit back-off in force until %s; not calling GitHub", until.Local().Format(time.Kitchen))
+	// Checked before every request: a response may exhaust the budget.
+	checkBackoff := func() error {
+		if blocked, until := gov.Blocked(); blocked {
+			return fmt.Errorf("rate-limit back-off in force until %s; not calling GitHub", until.Local().Format(time.Kitchen))
+		}
+		return nil
+	}
+	if err := checkBackoff(); err != nil {
+		return nil, err
 	}
 	gh := github.NewClient(os.Getenv("PRWATCH_GRAPHQL_URL"), "prwatch/"+version, &github.TokenSource{})
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -524,6 +541,9 @@ func statusDirect(dir string, refs []prref.Ref, version string) (map[string]stat
 	}
 	for i := 0; i < len(uniq); i += github.ChunkSize {
 		chunk := uniq[i:min(i+github.ChunkSize, len(uniq))]
+		if err := checkBackoff(); err != nil {
+			return nil, err
+		}
 		res, rate, err := gh.Resolve(ctx, chunk)
 		if err != nil {
 			return nil, handle(err)
@@ -540,7 +560,7 @@ func statusDirect(dir string, refs []prref.Ref, version string) (map[string]stat
 	}
 	if missing := github.MissingThreads(snaps, nil); len(missing) > 0 {
 		heads := map[string]github.ThreadHead{}
-		for i := 0; i < len(missing); i += 100 {
+		for i := 0; i < len(missing) && checkBackoff() == nil; i += 100 {
 			h, rate, err := gh.ThreadHeads(ctx, missing[i:min(i+100, len(missing))])
 			if err != nil {
 				return nil, handle(err)
@@ -585,7 +605,7 @@ func cmdEvents(args []string) int {
 	for _, r := range refs {
 		names = append(names, r.String())
 	}
-	code, _ := stream(dir, protocol.Request{Op: protocol.OpEvents, PRs: names}, nil, func(m protocol.Message) (int, bool) {
+	code, _ := stream(dir, protocol.Request{Op: protocol.OpEvents, PRs: names}, time.Time{}, func(m protocol.Message) (int, bool) {
 		if m.Snapshot == nil {
 			return 0, false
 		}

@@ -748,3 +748,144 @@ func TestDaemonStatusAndStop(t *testing.T) {
 		t.Fatalf("waiter after stop: %d %q", res.code, res.stderr)
 	}
 }
+
+func TestZeroBudgetStopsFurtherRequestsInRound(t *testing.T) {
+	e := newEnv(t)
+	k := e.fake.AddPR("o", "r", 1)
+	e.fake.Update(k, func(p *github.RawPR) {
+		p.ReviewThreads.TotalCount = 1
+		p.ReviewThreads.Nodes = []github.RawThread{{ID: "T1", Path: "a.go"}}
+	})
+	e.fake.SetThreadHead("T1", "alice", "hm")
+	// One point left: the resolve request spends it and reports zero.
+	e.fake.SetBudget(5000, 1)
+	r := e.run("status", "o/r#1", "--json")
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	if n := len(e.fake.Requests()); n != 1 {
+		t.Fatalf("%d requests; the thread request must not follow an exhausting response", n)
+	}
+	if r := e.run("status", "o/r#1"); r.code == 0 || !strings.Contains(r.stderr, "back-off") {
+		t.Fatalf("second status should honour the back-off: %d %s", r.code, r.stderr)
+	}
+}
+
+func TestNewInterestRespectsBudget(t *testing.T) {
+	e := newEnv(t)
+	for i := 1; i <= 3; i++ {
+		e.fake.AddPR("o", "r", i)
+	}
+	// 100 points left in the hour at 20%: 20 rounds, one per 3 minutes.
+	e.fake.SetBudget(5000, 101)
+	p1 := e.start("wait", "o/r#1", "--for", "merged")
+	e.waitWatched(1, 1)
+	e.start("wait", "o/r#2", "--for", "merged")
+	e.start("wait", "o/r#3", "--for", "merged")
+	time.Sleep(1500 * time.Millisecond)
+	if n := len(e.fake.Requests()); n != 1 {
+		t.Fatalf("%d requests; new interest must wait for the budget gap", n)
+	}
+	l := e.run("list")
+	if !strings.Contains(l.stdout, "(not fetched yet)") {
+		t.Fatalf("list:\n%s", l.stdout)
+	}
+	_ = p1.cmd.Process.Kill()
+}
+
+func TestStopAbortsInFlightRequest(t *testing.T) {
+	e := newEnv(t)
+	e.fake.AddPR("o", "r", 1)
+	e.fake.SetDelay(20 * time.Second)
+	p := e.start("wait", "o/r#1", "--for", "merged")
+	eventually(t, 5*time.Second, "daemon to start", e.daemonRunning)
+	time.Sleep(300 * time.Millisecond) // let the resolve request start
+	start := time.Now()
+	if r := e.run("daemon", "stop"); r.code != 0 {
+		t.Fatalf("stop: %d", r.code)
+	}
+	eventually(t, 3*time.Second, "daemon to exit", func() bool { return strings.Contains(e.logText(), "daemon exiting") })
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("shutdown took %s with a request in flight", d)
+	}
+	p.wait(t, 3*time.Second)
+}
+
+func TestTimeoutCoversConnecting(t *testing.T) {
+	e := newEnv(t)
+	e.fake.AddPR("o", "r", 1)
+	e.fake.SetDelay(20 * time.Second)
+	// A socket that accepts but never greets, and holds the lock so no
+	// real daemon can take over.
+	sock := filepath.Join(e.dir, "prwatch.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	lock, err := os.OpenFile(filepath.Join(e.dir, "daemon.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	start := time.Now()
+	r := e.run("wait", "o/r#1", "--timeout", "1s")
+	if r.code != 124 {
+		t.Fatalf("exit %d, want 124: %s", r.code, r.stderr)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("timeout took %s", d)
+	}
+}
+
+func TestStatusManyPRsViaDaemon(t *testing.T) {
+	e := newEnv(t)
+	var args []string
+	for i := 1; i <= 300; i++ {
+		e.fake.AddPR("o", "r", i)
+		args = append(args, "--pr", fmt.Sprintf("o/r#%d", i))
+	}
+	ev := e.start(append([]string{"events", "--json"}, args...)...)
+	eventually(t, 15*time.Second, "300 initial events", func() bool { return strings.Count(ev.out.String(), "\n") >= 300 })
+	var prs []string
+	for i := 300; i >= 1; i-- {
+		prs = append(prs, fmt.Sprintf("o/r#%d", i))
+	}
+	r := e.run(append([]string{"status", "--json"}, prs...)...)
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	var snaps []snapshot.Snapshot
+	if err := json.Unmarshal([]byte(r.stdout), &snaps); err != nil || len(snaps) != 300 {
+		t.Fatalf("got %d snapshots: %v", len(snaps), err)
+	}
+	if snaps[0].Number != 300 || snaps[299].Number != 1 {
+		t.Fatal("status output not in argument order")
+	}
+}
+
+func TestStatusMixedCachedAndNew(t *testing.T) {
+	e := newEnv(t)
+	e.fake.AddPR("o", "r", 1)
+	e.fake.AddPR("o", "r", 2)
+	p := e.start("wait", "o/r#1", "--for", "merged")
+	e.waitWatched(1, 1)
+	r := e.run("status", "O/R#1", "o/r#2", "--json")
+	var snaps []snapshot.Snapshot
+	if r.code != 0 || json.Unmarshal([]byte(r.stdout), &snaps) != nil || len(snaps) != 2 {
+		t.Fatalf("exit %d: %q %s", r.code, r.stdout, r.stderr)
+	}
+	_ = p.cmd.Process.Kill()
+}

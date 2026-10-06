@@ -83,3 +83,23 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatal("share > 1 accepted")
 	}
 }
+
+func TestNewInterestWaitsForBudgetGap(t *testing.T) {
+	d := testDaemon()
+	now := time.Now()
+	d.gov.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 4, ResetAt: now.Add(time.Hour)})
+	w := &watch{needsRefresh: true, subs: map[*sub]struct{}{{}: {}}}
+	d.watches = map[string]*watch{"o/r#1": w}
+	d.pendingSince = now
+	d.lastRequest = now
+	at, ok := d.nextWakeLocked()
+	if !ok || at.Before(now.Add(59*time.Minute)) {
+		t.Fatalf("pending fetch scheduled at %s; with 4 points left it must wait for the reset", at.Sub(now))
+	}
+	// With a healthy budget, new interest is served after MinGap.
+	d.gov.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 5000, ResetAt: now.Add(time.Hour)})
+	at, _ = d.nextWakeLocked()
+	if gap := at.Sub(now); gap < 3*time.Second || gap > 4*time.Second {
+		t.Fatalf("pending fetch after %s; want the 3.6s budget gap", gap)
+	}
+}

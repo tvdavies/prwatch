@@ -147,11 +147,11 @@ func (c *Client) Resolve(ctx context.Context, refs []prref.Ref) ([]Result, RateI
 		}
 		raw := repo[prAlias]
 		if len(raw) == 0 || string(raw) == "null" {
-			msg := errsByPath[path]
-			if msg == "" {
-				msg = errsByPath[repoAlias]
+			e, ok := errsByPath[path]
+			if !ok {
+				e = errsByPath[repoAlias]
 			}
-			res.Err = &NotFoundError{Ref: ref, Message: msg}
+			res.Err = aliasError(ref, e)
 			out = append(out, res)
 			continue
 		}
@@ -183,7 +183,7 @@ func (c *Client) Poll(ctx context.Context, targets []Target) ([]Result, RateInfo
 		res := Result{Ref: t.Ref, NodeID: t.NodeID}
 		raw := resp.Data[alias]
 		if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
-			res.Err = &NotFoundError{Ref: t.Ref, Message: errsByPath[alias]}
+			res.Err = aliasError(t.Ref, errsByPath[alias])
 			out = append(out, res)
 			continue
 		}
@@ -259,8 +259,23 @@ func FillThreads(s *snapshot.Snapshot, heads map[string]ThreadHead) {
 	}
 }
 
-func errorsByPath(errs []GQLError) map[string]string {
-	out := map[string]string{}
+// aliasError classifies why a PR alias came back null. GitHub reports a
+// missing or invisible PR as NOT_FOUND; FORBIDDEN (e.g. SAML enforcement)
+// is an access problem; anything else is treated as transient so the
+// watch is retried rather than dropped. A null with no error at all is
+// treated as not found.
+func aliasError(ref prref.Ref, e GQLError) error {
+	switch {
+	case e.Type == "" && e.Message == "", e.Type == "NOT_FOUND":
+		return &NotFoundError{Ref: ref, Message: e.Message}
+	case e.Type == "FORBIDDEN" || strings.Contains(e.Message, "SAML"):
+		return &AuthError{Message: fmt.Sprintf("%s: %s", ref, e.Message)}
+	}
+	return &TransientError{Err: fmt.Errorf("%s: %s (%s)", ref, e.Message, e.Type)}
+}
+
+func errorsByPath(errs []GQLError) map[string]GQLError {
+	out := map[string]GQLError{}
 	for _, e := range errs {
 		var parts []string
 		for _, p := range e.Path {
@@ -271,7 +286,7 @@ func errorsByPath(errs []GQLError) map[string]string {
 		for i := 1; i <= len(parts); i++ {
 			k := strings.Join(parts[:i], ".")
 			if _, ok := out[k]; !ok {
-				out[k] = e.Message
+				out[k] = e
 			}
 		}
 	}
@@ -485,6 +500,9 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 		s.Threads.Items = append(s.Threads.Items, snapshot.Thread{ID: t.ID, Path: t.Path, Line: line, Outdated: t.IsOutdated})
 	}
 	s.Threads.Unresolved = len(s.Threads.Items)
+	// Only the most recent 100 threads are fetched; older ones may hide
+	// unresolved threads, so such a PR is never reported as ready.
+	s.Threads.Truncated = p.ReviewThreads.TotalCount > len(p.ReviewThreads.Nodes)
 	s.Comments.Total = p.Comments.TotalCount
 	for _, c := range p.Comments.Nodes {
 		s.Comments.Recent = append(s.Comments.Recent, snapshot.Comment{Author: c.Author.name(), CreatedAt: c.CreatedAt, Excerpt: snapshot.Excerpt(c.BodyText, 160)})

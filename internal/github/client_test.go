@@ -150,3 +150,40 @@ func TestResolveDecodesAndReportsNotFound(t *testing.T) {
 		t.Fatalf("found %d missing %d", found, missing)
 	}
 }
+
+func TestNullAliasClassification(t *testing.T) {
+	ref := prref.Ref{Owner: "o", Repo: "r", Number: 1}
+	var nf *NotFoundError
+	var ae *AuthError
+	var te *TransientError
+	if err := aliasError(ref, GQLError{}); !errors.As(err, &nf) {
+		t.Errorf("no error: %T", err)
+	}
+	if err := aliasError(ref, GQLError{Type: "NOT_FOUND", Message: "x"}); !errors.As(err, &nf) {
+		t.Errorf("NOT_FOUND: %T", err)
+	}
+	if err := aliasError(ref, GQLError{Type: "FORBIDDEN", Message: "Resource not accessible by integration"}); !errors.As(err, &ae) {
+		t.Errorf("FORBIDDEN: %T", err)
+	}
+	if err := aliasError(ref, GQLError{Message: "Although you appear to have the correct authorization credentials, the org has enabled SAML"}); !errors.As(err, &ae) {
+		t.Errorf("SAML: %T", err)
+	}
+	if err := aliasError(ref, GQLError{Type: "INTERNAL", Message: "Something went wrong"}); !errors.As(err, &te) {
+		t.Errorf("INTERNAL: %T", err)
+	}
+}
+
+func TestTruncatedThreads(t *testing.T) {
+	p := &RawPR{State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"}
+	p.ReviewThreads.TotalCount = 150
+	p.ReviewThreads.Nodes = []RawThread{{ID: "a", IsResolved: true}}
+	s := ToSnapshot(p, prref.Ref{Owner: "o", Repo: "r", Number: 1}, time.Now())
+	if !s.Threads.Truncated || s.Threads.Unresolved != 0 {
+		t.Fatalf("threads %+v", s.Threads)
+	}
+	for _, r := range s.Reasons {
+		if r == "ready_auto_merge_off" {
+			t.Fatal("a PR with unseen threads must not be ready")
+		}
+	}
+}
