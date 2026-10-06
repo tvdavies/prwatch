@@ -71,9 +71,9 @@ A `<pr>` can be:
 | --- | --- |
 | 0 | condition met (or command succeeded) |
 | 124 | `--timeout` elapsed; the latest snapshot is still printed |
-| 2 | usage or authentication error |
+| 2 | usage or authentication error, including a PR GitHub refuses to show (`FORBIDDEN`, SAML) |
 | 3 | PR or repository not found |
-| 1 | anything else, such as the daemon being stopped while you wait |
+| 1 | anything else, such as a temporary GitHub error, a back-off, an [incomplete](#snapshot-json) snapshot from `status`, or the daemon being stopped while you wait |
 
 ## Snapshot JSON
 
@@ -109,7 +109,8 @@ A `<pr>` can be:
   "needsAction": true,
   "reasons": ["unresolved_threads"],
   "token": "1.3fa9c1e2b7d04a11.9a1b2c3d",
-  "fetchedAt": "…"
+  "fetchedAt": "…",
+  "incomplete": false
 }
 ```
 
@@ -120,6 +121,11 @@ The values come from GitHub's GraphQL API:
 - `reviewDecision` is null when no review policy applies.
 - `reviews` holds the latest review from each author.
 - `reviewCount` counts every review, including replies in threads.
+
+`incomplete` is true when GitHub returned the PR but an error nulled part of it (its checks, for example). `incompleteReason` then says which field failed and why. An incomplete snapshot is never treated as authoritative:
+- it never satisfies a `--for` condition and is never `ready_auto_merge_off`;
+- the daemon keeps the previous good snapshot, emits no change event and fetches the PR again next round;
+- `status` prints it only when there is no previous good snapshot, and then exits 1.
 
 `needsAction` is true when `reasons` is non-empty. For open PRs only, the reasons are:
 
@@ -151,8 +157,8 @@ The values come from GitHub's GraphQL API:
 
 ## Rate limits
 
-- **Adaptive interval:** about 10s while any watched PR has pending checks, auto-merge enabled or unknown mergeability; otherwise about 60s; never below 5s.
-- **Budget guard:** prwatch spends at most `PRWATCH_BUDGET_SHARE` (20% by default) of the primary budget remaining before reset. As the budget shrinks, the interval stretches to match the last round's cost. If less than one round is affordable, it waits for the reset.
+- **Adaptive interval:** about 10s while any watched PR has pending checks, auto-merge enabled or unknown mergeability; otherwise about 60s. Rounds never start less than 5s apart, including the fetches for newly watched PRs.
+- **Budget guard:** prwatch spends at most `PRWATCH_BUDGET_SHARE` (20% by default) of the primary budget remaining before reset. As the budget shrinks, the interval stretches to match the last round's cost. If less than one round is affordable, it waits for the reset. The budget is persisted to `rate.json`, so a restarted daemon with a low stored budget also waits for the reset.
 - **Strict back-off:**
   - it honours `retry-after`;
   - if the primary budget is exhausted, it waits until `x-ratelimit-reset`;

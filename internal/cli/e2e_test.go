@@ -889,3 +889,122 @@ func TestStatusMixedCachedAndNew(t *testing.T) {
 	}
 	_ = p.cmd.Process.Kill()
 }
+
+func TestRestartedDaemonHonoursLowStoredBudget(t *testing.T) {
+	e := newEnv(t)
+	e.fake.AddPR("o", "r", 1)
+	// An earlier daemon stopped with 4 points left: 20% of that does not pay
+	// for a round, so the new daemon must wait for the reset.
+	now := time.Now()
+	reset := now.Add(3 * time.Second)
+	state := fmt.Sprintf(`{"limit":5000,"remaining":4,"used":4996,"resetAt":%q,"roundCost":1,"updatedAt":%q}`,
+		reset.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(e.dir, "rate.json"), []byte(state), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := e.start("wait", "o/r#1", "--for", "merged")
+	time.Sleep(1500 * time.Millisecond)
+	if n := len(e.fake.Requests()); n != 0 {
+		t.Fatalf("%d requests before the reset with 4 stored points", n)
+	}
+	if r := e.run("status", "o/r#1"); r.code == 0 || !strings.Contains(r.stderr, "backed off") {
+		t.Fatalf("status during the reserve: exit %d: %s", r.code, r.stderr)
+	}
+	e.waitWatched(1, 1)
+	reqs := e.fake.Requests()
+	if reqs[0].At.Before(reset) {
+		t.Fatalf("first request at %s, before the reset at %s", reqs[0].At, reset)
+	}
+	if !strings.Contains(e.logText(), "stored budget is below the reserve") {
+		t.Fatal("expected the stored reserve in the log")
+	}
+	_ = p.cmd.Process.Kill()
+}
+
+func TestDirectStatusExitCodesForPRErrors(t *testing.T) {
+	e := newEnv(t)
+	e.fake.AddPR("o", "r", 1)
+	nullPR := func(typ, msg string) fakegh.Response {
+		return fakegh.Response{Status: 200, Body: fmt.Sprintf(`{"data":{"r0":{"q0":null},"rateLimit":{"cost":1,"limit":5000,"remaining":4000,"used":1000,"resetAt":%q}},`+
+			`"errors":[{"type":%q,"path":["r0","q0"],"message":%q}]}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339), typ, msg)}
+	}
+	cases := []struct {
+		name string
+		resp fakegh.Response
+		want int
+	}{
+		{"forbidden", nullPR("FORBIDDEN", "Resource not accessible by integration"), 2},
+		{"SAML", nullPR("FORBIDDEN", "Resource protected by organization SAML enforcement"), 2},
+		{"transient", nullPR("INTERNAL", "Something went wrong while executing your query"), 1},
+		{"not found", nullPR("NOT_FOUND", "Could not resolve to a PullRequest"), 3},
+	}
+	for _, c := range cases {
+		e.fake.Inject(c.resp)
+		if r := e.run("status", "o/r#1"); r.code != c.want {
+			t.Errorf("%s: exit %d, want %d: %s", c.name, r.code, c.want, r.stderr)
+		}
+	}
+	if e.daemonRunning() {
+		t.Fatal("status started a daemon")
+	}
+}
+
+func TestNestedErrorNeverSatisfiesWaitersAndKeepsSnapshot(t *testing.T) {
+	e := newEnv(t)
+	k := e.fake.AddPR("o", "r", 1)
+	e.fake.Update(k, func(p *github.RawPR) { fakegh.SetChecks(p, "PENDING") })
+
+	checks := e.start("wait", "o/r#1", "--for", "checks", "--json")
+	mergeable := e.start("wait", "o/r#1", "--for", "mergeable", "--json")
+	ev := e.start("events", "--pr", "o/r#1", "--json")
+	e.waitWatched(1, 3)
+	eventsBefore := ev.out.String()
+	good := e.list().PRs[0].Snapshot
+
+	// Two polls return the PR with commits nulled by an error. Taken at
+	// face value its checks would be NONE: settled, green and mergeable.
+	before := len(e.fake.Requests())
+	e.fake.FailCommits(k, 2)
+	eventually(t, 5*time.Second, "two polls with a nested error", func() bool { return len(e.fake.Requests()) >= before+3 })
+	if !checks.running() || !mergeable.running() {
+		t.Fatalf("a waiter returned on partial data: checks %q, mergeable %q", checks.out.String(), mergeable.out.String())
+	}
+	if got := ev.out.String(); got != eventsBefore {
+		t.Fatalf("change event built from partial data:\n%s", strings.TrimPrefix(got, eventsBefore))
+	}
+	kept := e.list().PRs[0].Snapshot
+	if kept == nil || kept.Incomplete || kept.Checks.State != "PENDING" || kept.Token != good.Token {
+		t.Fatalf("previous good snapshot not kept: %+v", kept)
+	}
+	if !strings.Contains(e.logText(), "PR returned incomplete; keeping the previous snapshot") {
+		t.Fatal("expected the incomplete response in the log")
+	}
+
+	// Once GitHub answers fully, the real state is reported.
+	e.fake.Update(k, func(p *github.RawPR) { fakegh.SetChecks(p, "SUCCESS") })
+	if r := checks.wait(t, 5*time.Second); r.code != 0 || parseSnap(t, r.stdout).Checks.State != "SUCCESS" {
+		t.Fatalf("checks waiter: exit %d %q", r.code, r.stdout)
+	}
+	if r := mergeable.wait(t, 5*time.Second); r.code != 0 || parseSnap(t, r.stdout).Incomplete {
+		t.Fatalf("mergeable waiter: exit %d %q", r.code, r.stdout)
+	}
+}
+
+func TestDirectStatusReportsIncomplete(t *testing.T) {
+	e := newEnv(t)
+	k := e.fake.AddPR("o", "r", 1)
+	e.fake.Update(k, func(p *github.RawPR) { fakegh.SetChecks(p, "PENDING") })
+	e.fake.FailCommits(k, 1)
+	r := e.run("status", "o/r#1", "--json")
+	if r.code != 1 || !strings.Contains(r.stderr, "incomplete") {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	var snaps []snapshot.Snapshot
+	if err := json.Unmarshal([]byte(r.stdout), &snaps); err != nil || len(snaps) != 1 {
+		t.Fatalf("status json %q: %v", r.stdout, err)
+	}
+	s := snaps[0]
+	if !s.Incomplete || !strings.Contains(s.IncompleteReason, "commits") || snapshot.Ready(&s) {
+		t.Fatalf("snapshot: incomplete %v reason %q", s.Incomplete, s.IncompleteReason)
+	}
+}

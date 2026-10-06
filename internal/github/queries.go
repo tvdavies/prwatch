@@ -133,7 +133,6 @@ func (c *Client) Resolve(ctx context.Context, refs []prref.Ref) ([]Result, RateI
 	if err != nil {
 		return nil, RateInfo{}, err
 	}
-	errsByPath := errorsByPath(resp.Errors)
 	var out []Result
 	now := time.Now()
 	for path, ref := range aliases {
@@ -145,11 +144,15 @@ func (c *Client) Resolve(ctx context.Context, refs []prref.Ref) ([]Result, RateI
 				return nil, resp.Rate, fmt.Errorf("decode repository: %w", err)
 			}
 		}
+		prPath := []string{repoAlias, prAlias}
 		raw := repo[prAlias]
 		if len(raw) == 0 || string(raw) == "null" {
-			e, ok := errsByPath[path]
+			e, ok := errorAt(resp.Errors, prPath)
 			if !ok {
-				e = errsByPath[repoAlias]
+				e, ok = errorAt(resp.Errors, prPath[:1])
+			}
+			if !ok {
+				e, _ = errorAt(resp.Errors, nil)
 			}
 			res.Err = aliasError(ref, e)
 			out = append(out, res)
@@ -159,6 +162,7 @@ func (c *Client) Resolve(ctx context.Context, refs []prref.Ref) ([]Result, RateI
 		if err != nil {
 			return nil, resp.Rate, err
 		}
+		markIncomplete(snap, resp.Errors, prPath)
 		res.Snapshot, res.NodeID = snap, id
 		out = append(out, res)
 	}
@@ -175,7 +179,6 @@ func (c *Client) Poll(ctx context.Context, targets []Target) ([]Result, RateInfo
 	if err != nil {
 		return nil, RateInfo{}, err
 	}
-	errsByPath := errorsByPath(resp.Errors)
 	now := time.Now()
 	out := make([]Result, 0, len(targets))
 	for i, t := range targets {
@@ -183,7 +186,11 @@ func (c *Client) Poll(ctx context.Context, targets []Target) ([]Result, RateInfo
 		res := Result{Ref: t.Ref, NodeID: t.NodeID}
 		raw := resp.Data[alias]
 		if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
-			res.Err = aliasError(t.Ref, errsByPath[alias])
+			e, ok := errorAt(resp.Errors, []string{alias})
+			if !ok {
+				e, _ = errorAt(resp.Errors, nil)
+			}
+			res.Err = aliasError(t.Ref, e)
 			out = append(out, res)
 			continue
 		}
@@ -191,6 +198,7 @@ func (c *Client) Poll(ctx context.Context, targets []Target) ([]Result, RateInfo
 		if err != nil {
 			return nil, resp.Rate, err
 		}
+		markIncomplete(snap, resp.Errors, []string{alias})
 		res.Snapshot = snap
 		out = append(out, res)
 	}
@@ -274,23 +282,58 @@ func aliasError(ref prref.Ref, e GQLError) error {
 	return &TransientError{Err: fmt.Errorf("%s: %s (%s)", ref, e.Message, e.Type)}
 }
 
-func errorsByPath(errs []GQLError) map[string]GQLError {
-	out := map[string]GQLError{}
+// errorAt returns the first error whose path is exactly path. A nil path
+// matches errors that carry no path at all.
+func errorAt(errs []GQLError, path []string) (GQLError, bool) {
 	for _, e := range errs {
-		var parts []string
-		for _, p := range e.Path {
-			if s, ok := p.(string); ok {
-				parts = append(parts, s)
-			}
-		}
-		for i := 1; i <= len(parts); i++ {
-			k := strings.Join(parts[:i], ".")
-			if _, ok := out[k]; !ok {
-				out[k] = e
-			}
+		if len(e.Path) == len(path) && pathHasPrefix(e.Path, path) {
+			return e, true
 		}
 	}
-	return out
+	return GQLError{}, false
+}
+
+// pathHasPrefix reports whether a GraphQL error path starts with prefix.
+func pathHasPrefix(path []any, prefix []string) bool {
+	if len(path) < len(prefix) {
+		return false
+	}
+	for i, p := range prefix {
+		if s, ok := path[i].(string); !ok || s != p {
+			return false
+		}
+	}
+	return true
+}
+
+// markIncomplete flags a decoded PR as incomplete when any GraphQL error
+// lies beneath its alias, or carries no path and so may affect any PR.
+// Such an error nulls a nested field (commits, for example), which would
+// otherwise decode as a plausible but false value such as "no checks".
+func markIncomplete(s *snapshot.Snapshot, errs []GQLError, alias []string) {
+	var reasons []string
+	for _, e := range errs {
+		switch {
+		case len(e.Path) == 0:
+			reasons = append(reasons, e.Message)
+		case len(e.Path) > len(alias) && pathHasPrefix(e.Path, alias):
+			reasons = append(reasons, fmt.Sprintf("%s: %s", formatPath(e.Path[len(alias):]), e.Message))
+		}
+	}
+	if len(reasons) == 0 {
+		return
+	}
+	s.Incomplete = true
+	s.IncompleteReason = "GitHub returned partial data: " + strings.Join(reasons, "; ")
+	s.Finalise()
+}
+
+func formatPath(path []any) string {
+	parts := make([]string, len(path))
+	for i, p := range path {
+		parts[i] = fmt.Sprint(p)
+	}
+	return strings.Join(parts, ".")
 }
 
 // Actor is a GraphQL actor.

@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"io"
+	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -96,10 +99,49 @@ func TestNewInterestWaitsForBudgetGap(t *testing.T) {
 	if !ok || at.Before(now.Add(59*time.Minute)) {
 		t.Fatalf("pending fetch scheduled at %s; with 4 points left it must wait for the reset", at.Sub(now))
 	}
-	// With a healthy budget, new interest is served after MinGap.
+	// With a healthy budget the budget gap is 3.6s, but no two requests are
+	// ever closer than the 5s poll floor.
 	d.gov.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 5000, ResetAt: now.Add(time.Hour)})
 	at, _ = d.nextWakeLocked()
-	if gap := at.Sub(now); gap < 3*time.Second || gap > 4*time.Second {
-		t.Fatalf("pending fetch after %s; want the 3.6s budget gap", gap)
+	if gap := at.Sub(now); gap < 5*time.Second || gap > 5100*time.Millisecond {
+		t.Fatalf("pending fetch after %s; want the 5s minimum interval", gap)
+	}
+	// The floor also applies to scheduled rounds.
+	d.watches["o/r#1"].needsRefresh = false
+	d.watches["o/r#1"].nodeID = "PR_1"
+	d.watches["o/r#1"].snap = snap(func(s *snapshot.Snapshot) { s.Checks.State = "PENDING" })
+	d.cfg.FastInterval = time.Second
+	d.lastRound = now
+	at, _ = d.nextWakeLocked()
+	if gap := at.Sub(now); gap < 5*time.Second {
+		t.Fatalf("scheduled round after %s; want at least the 5s minimum interval", gap)
+	}
+}
+
+func TestRestartWithLowStoredBudgetWaitsForReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rate.json")
+	now := time.Now()
+	reset := now.Add(time.Hour)
+	// An earlier daemon left 4 points in rate.json.
+	prev := ratelimit.New(path)
+	prev.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 4, ResetAt: reset})
+	prev.SetRoundCost(1)
+
+	d := testDaemon()
+	d.gov = ratelimit.New(path)
+	d.log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	d.restoreRateState()
+	if d.lastRequest.IsZero() {
+		t.Fatal("lastRequest not restored from rate.json")
+	}
+	d.lastRequest = time.Time{} // even with no record of the last request
+	d.watches = map[string]*watch{"o/r#1": {needsRefresh: true, subs: map[*sub]struct{}{{}: {}}}}
+	d.pendingSince = now
+	at, ok := d.nextWakeLocked()
+	if !ok || at.Before(reset) {
+		t.Fatalf("pending fetch scheduled in %s; with 4 stored points it must wait for the reset", at.Sub(now))
+	}
+	if !d.budgetBlocked() {
+		t.Fatal("a round must not run while the budget is below the reserve")
 	}
 }

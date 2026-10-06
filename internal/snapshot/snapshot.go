@@ -46,6 +46,11 @@ type Snapshot struct {
 	Reasons          []string   `json:"reasons"`
 	Token            string     `json:"token"`
 	FetchedAt        time.Time  `json:"fetchedAt"`
+	// Incomplete is true when GitHub returned the PR but an error nulled
+	// part of it, so some fields (checks, for example) may be missing.
+	// An incomplete snapshot never satisfies a wait condition.
+	Incomplete       bool   `json:"incomplete"`
+	IncompleteReason string `json:"incompleteReason,omitempty"`
 }
 
 // AutoMerge describes the PR's auto-merge request.
@@ -214,9 +219,9 @@ func Approved(s *Snapshot) bool {
 }
 
 // Ready reports whether an open PR is approved, green, has no unresolved
-// threads and can be merged.
+// threads and can be merged. An incomplete snapshot is never ready.
 func Ready(s *Snapshot) bool {
-	if s.State != "OPEN" || s.IsDraft {
+	if s.Incomplete || s.State != "OPEN" || s.IsDraft {
 		return false
 	}
 	if !Approved(s) || !Green(s) || s.Threads.Unresolved > 0 || s.Threads.Truncated || s.Mergeable != "MERGEABLE" {
@@ -278,6 +283,7 @@ type allMaterial struct {
 	Comments    int      `json:"cm"`
 	LastComment string   `json:"lc"`
 	Review      string   `json:"rv"`
+	Incomplete  bool     `json:"inc,omitempty"`
 }
 
 // ComputeToken hashes the material fields of s.
@@ -306,6 +312,7 @@ func ComputeToken(s *Snapshot) Token {
 		Mergeable: s.Mergeable, MergeState: s.MergeStateStatus,
 		AutoMerge: s.AutoMerge.Enabled, AutoMethod: s.AutoMerge.Method,
 		Checks: s.Checks.State, Comments: s.Comments.Total, Review: review,
+		Incomplete: s.Incomplete,
 	}
 	am.Requests = append(am.Requests, s.ReviewRequests...)
 	sort.Strings(am.Requests)
@@ -360,8 +367,12 @@ type Waiter struct {
 	baseline *Token
 }
 
-// Met reports whether s satisfies the condition.
+// Met reports whether s satisfies the condition. An incomplete snapshot
+// never does, and never becomes the baseline.
 func (w *Waiter) Met(s *Snapshot) bool {
+	if s.Incomplete {
+		return false
+	}
 	cur := ComputeToken(s)
 	ref := w.Since
 	if ref == nil {
@@ -515,8 +526,12 @@ func Summary(s *Snapshot) string {
 	if s.NeedsAction {
 		need = strings.Join(s.Reasons, ",")
 	}
-	return fmt.Sprintf("%s  checks %s  review %s  needs action: %s",
+	out := fmt.Sprintf("%s  checks %s  review %s  needs action: %s",
 		state, s.Checks.State, orNone(deref(s.ReviewDecision)), need)
+	if s.Incomplete {
+		out += "  (incomplete)"
+	}
+	return out
 }
 
 // Format renders a multi-line human-readable view of s.
@@ -562,6 +577,9 @@ func Format(s *Snapshot) string {
 			loc = fmt.Sprintf("%s:%d", t.Path, *t.Line)
 		}
 		fmt.Fprintf(&b, "    %s  %s: %s\n", loc, t.Author, t.Excerpt)
+	}
+	if s.Incomplete {
+		fmt.Fprintf(&b, "  incomplete: %s\n", s.IncompleteReason)
 	}
 	if s.NeedsAction {
 		fmt.Fprintf(&b, "  needs action: yes (%s)\n", strings.Join(s.Reasons, ", "))

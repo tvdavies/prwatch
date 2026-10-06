@@ -103,3 +103,36 @@ func TestBudgetStretchesInterval(t *testing.T) {
 		t.Errorf("share 0.5, cost 2: %s", got)
 	}
 }
+
+func TestReserveUntil(t *testing.T) {
+	g, now := newGov(t)
+	if !g.ReserveUntil().IsZero() {
+		t.Fatal("unknown budget must not block")
+	}
+	reset := now.Add(time.Hour)
+	g.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 5000, ResetAt: reset})
+	if !g.ReserveUntil().IsZero() {
+		t.Fatal("a healthy budget must not block")
+	}
+	// 20% of 4 points does not pay for one round at cost 1.
+	g.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 4, ResetAt: reset})
+	if got := g.ReserveUntil(); !got.Equal(reset.Add(time.Second)) {
+		t.Fatalf("reserve until %s, want reset+1s", got)
+	}
+	*now = reset.Add(2 * time.Second)
+	if !g.ReserveUntil().IsZero() {
+		t.Fatal("the reserve must lift after the reset")
+	}
+}
+
+func TestReserveSurvivesRestart(t *testing.T) {
+	g, now := newGov(t)
+	reset := now.Add(time.Hour)
+	g.Observe(github.RateInfo{Known: true, Limit: 5000, Remaining: 4, ResetAt: reset})
+	g.SetRoundCost(1)
+	restarted := New(g.path)
+	restarted.Now = g.Now
+	if got := restarted.ReserveUntil(); !got.Equal(reset.Add(time.Second)) {
+		t.Fatalf("after restart: reserve until %s, want reset+1s", got)
+	}
+}

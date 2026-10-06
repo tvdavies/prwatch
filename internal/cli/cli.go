@@ -59,7 +59,8 @@ A <pr> is owner/repo#123, a GitHub PR URL, or 123 (or '#123') inside a
 checkout whose origin remote is on GitHub.
 
 Exit codes: 0 condition met, 124 timeout, 2 usage or auth error,
-3 PR not found, 1 other errors.
+3 PR not found, 1 other errors (including temporary GitHub errors and
+incomplete data).
 `
 
 // Main runs the CLI and returns the process exit code.
@@ -122,6 +123,13 @@ func usageErr(format string, a ...any) int {
 
 func fail(err error) int {
 	fmt.Fprintln(Stderr, "prwatch:", err)
+	return exitCode(err)
+}
+
+// exitCode maps an error to its documented exit code: authentication
+// failures are 2, a missing PR or repository is 3, and anything else,
+// including transient GitHub errors, is 1.
+func exitCode(err error) int {
 	var ae *github.AuthError
 	var nf *github.NotFoundError
 	var ce *codedError
@@ -424,6 +432,13 @@ func cmdStatus(args []string, version string) int {
 			if code == ExitOK {
 				code = res.code
 			}
+		case res.snap.Incomplete:
+			// Print it, but don't let a script read partial data as success.
+			fmt.Fprintf(Stderr, "prwatch: %s is incomplete: %s\n", res.snap.PR, res.snap.IncompleteReason)
+			snaps = append(snaps, res.snap)
+			if code == ExitOK {
+				code = ExitError
+			}
 		default:
 			snaps = append(snaps, res.snap)
 		}
@@ -551,7 +566,7 @@ func statusDirect(dir string, refs []prref.Ref, version string) (map[string]stat
 		gov.Observe(rate)
 		for _, r := range res {
 			if r.Err != nil {
-				out[r.Ref.Key()] = statusResult{err: r.Err, code: ExitNotFound}
+				out[r.Ref.Key()] = statusResult{err: r.Err, code: exitCode(r.Err)}
 				continue
 			}
 			out[r.Ref.Key()] = statusResult{snap: r.Snapshot}
