@@ -347,8 +347,13 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 			// No binary to start, a failed spawn, or a daemon that dies at
 			// start-up (during an upgrade, say): keep the handler's state
 			// and try again, rather than lose the wait.
+			// A wait with a deadline retries until it; anything else gives up
+			// after a bounded number of attempts.
+			if !deadlineAt.IsZero() && !time.Now().Before(deadlineAt) {
+				return 0, false
+			}
 			attempts++
-			if attempts >= retry.attempts {
+			if deadlineAt.IsZero() && attempts >= retry.attempts {
 				return fail(fmt.Errorf("gave up after %d attempts to start or reach the daemon: %w", attempts, err)), true
 			}
 			if outage == nil {
@@ -435,23 +440,21 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 				}
 			}
 		}
-		// Spread reconnecting clients out a little, so that most find the
-		// daemon the first one back started rather than each starting one.
-		time.Sleep(50*time.Millisecond + rand.N(100*time.Millisecond))
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
 // retryPolicy bounds how a wait or events stream retries when no daemon can
 // be started or reached.
 type retryPolicy struct {
-	attempts int           // give up (exit 1) after this many in a row
+	attempts int           // without a deadline, give up (exit 1) after this many in a row
 	base     time.Duration // first back-off
 	max      time.Duration // back-off cap
 }
 
 // retryFromEnv returns the default policy: back-off from 250ms doubling to
-// 10s, giving up after 20 attempts in a row (about 2.5 minutes) unless the
-// wait's deadline comes first. PRWATCH_RETRY_ATTEMPTS and PRWATCH_RETRY_MAX
+// 10s; a stream without a deadline gives up after 20 attempts in a row
+// (about two minutes). PRWATCH_RETRY_ATTEMPTS and PRWATCH_RETRY_MAX
 // override the count and the cap, for tests.
 func retryFromEnv() retryPolicy {
 	p := retryPolicy{attempts: 20, base: 250 * time.Millisecond, max: 10 * time.Second}

@@ -14,15 +14,6 @@ import (
 	"github.com/tvdavies/prwatch/internal/github"
 )
 
-// startEnv is start with extra environment for this process only.
-func (e *env) startEnv(extra []string, args ...string) *proc {
-	e.t.Helper()
-	saved := e.extra
-	e.extra = append(append([]string(nil), saved...), extra...)
-	defer func() { e.extra = saved }()
-	return e.start(args...)
-}
-
 // spawns returns the "starting daemon" lines clients wrote to the log.
 func (e *env) spawns() []string {
 	var out []string
@@ -336,15 +327,17 @@ func TestRespawnRetriesUntilBinaryAppears(t *testing.T) {
 }
 
 // With nothing to start a daemon from, a wait retries until its deadline
-// and then times out as usual (124), and an events stream, which has no
-// deadline, gives up after a bounded number of attempts (1).
+// and then times out as usual (124), however many attempts that takes, and
+// an events stream, which has no deadline, gives up after a bounded number
+// of attempts (1).
 func TestRespawnFailsUntilDeadline(t *testing.T) {
 	e := newEnv(t, "PRWATCH_RETRY_MAX=300ms")
 	remove := withVanishingBinary(t, e, filepath.Join(e.dir, "never", "prwatch"))
 	e.fake.AddPR("o", "r", 1)
 	started := time.Now()
+	e.extra = append(e.extra, "PRWATCH_RETRY_ATTEMPTS=4")
 	w := e.start("wait", "o/r#1", "--for", "merged", "--timeout", "6s")
-	ev := e.startEnv([]string{"PRWATCH_RETRY_ATTEMPTS=4"}, "events", "--pr", "o/r#1")
+	ev := e.start("events", "--pr", "o/r#1")
 	e.waitWatched(1, 2)
 	oldPID, _ := e.daemon()
 	remove()

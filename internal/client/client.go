@@ -3,6 +3,7 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,7 +64,6 @@ func DialUntil(stateDir string, spawn bool, callerDeadline time.Time) (*Conn, er
 	delay := 10 * time.Millisecond
 	var lastSpawn time.Time
 	spawnGap := 500 * time.Millisecond
-	var child <-chan struct{} // closed when the daemon we started exits
 	var lastErr error
 	for {
 		c, err := tryDial(sock, deadline)
@@ -84,15 +85,15 @@ func DialUntil(stateDir string, spawn bool, callerDeadline time.Time) (*Conn, er
 		}
 		// While the daemon we started is alive it is either starting up or
 		// waiting to see whether another one wins, so don't start more.
-		if exited(child) && time.Since(lastSpawn) > spawnGap {
+		// That holds across calls: a stream that retries does not pile up
+		// daemons that never came up.
+		if exited(liveChild()) && time.Since(lastSpawn) > spawnGap {
 			if !lastSpawn.IsZero() {
 				spawnGap = min(spawnGap*2, 4*time.Second)
 			}
-			done, err := Spawn(stateDir)
-			if err != nil {
+			if err := Spawn(stateDir, deadline); err != nil {
 				return nil, &SpawnError{err}
 			}
-			child = done
 			lastSpawn = time.Now()
 		}
 		time.Sleep(delay)
@@ -128,6 +129,18 @@ func isNoListener(err error) bool {
 	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
+// child is closed when the last daemon this process started exits.
+var (
+	childMu sync.Mutex
+	child   <-chan struct{}
+)
+
+func liveChild() <-chan struct{} {
+	childMu.Lock()
+	defer childMu.Unlock()
+	return child
+}
+
 func exited(child <-chan struct{}) bool {
 	if child == nil {
 		return true
@@ -143,20 +156,30 @@ func exited(child <-chan struct{}) bool {
 // Spawn starts a detached daemon from the binary ResolveExecutable picks,
 // with the hidden __daemon subcommand, in a new session, with output to the
 // log file. It logs the binary it chose, and why it skipped any before it,
-// to the daemon log. The returned channel is closed when the daemon exits.
-func Spawn(stateDir string) (<-chan struct{}, error) {
+// to the daemon log. Checking candidates stops at the deadline (zero for
+// none), and nothing is started after it.
+func Spawn(stateDir string, deadline time.Time) error {
+	ctx := context.Background()
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	logPath := paths.Log(stateDir)
 	rotateLog(logPath)
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer logf.Close()
 	log := slog.New(slog.NewTextHandler(logf, nil))
-	bin, err := ResolveExecutable()
+	bin, err := ResolveExecutable(ctx)
+	if err == nil {
+		err = ctx.Err()
+	}
 	if err != nil {
 		log.Warn("cannot start daemon", "client", os.Getpid(), "err", err)
-		return nil, err
+		return err
 	}
 	attrs := []any{"exe", bin.Path, "via", bin.Via, "version", bin.Version, "client", os.Getpid()}
 	if len(bin.Skipped) > 0 {
@@ -165,7 +188,7 @@ func Spawn(stateDir string) (<-chan struct{}, error) {
 	log.Info("starting daemon", attrs...)
 	devnull, err := os.Open(os.DevNull)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer devnull.Close()
 	cmd := exec.Command(bin.Path, "__daemon")
@@ -177,13 +200,16 @@ func Spawn(stateDir string) (<-chan struct{}, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		log.Warn("cannot start daemon", "exe", bin.Path, "client", os.Getpid(), "err", err)
-		return nil, err
+		return err
 	}
 	// Reap the child if it exits while we are still running (for example
 	// when it lost the start-up race).
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()
-	return done, nil
+	childMu.Lock()
+	child = done
+	childMu.Unlock()
+	return nil
 }
 
 func rotateLog(path string) {

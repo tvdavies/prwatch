@@ -240,8 +240,10 @@ func logTime(t *testing.T, log, what string) time.Time {
 func TestSIGHUPHandsOverAndSIGTERMStops(t *testing.T) {
 	e := newEnv(t)
 	e.fake.AddPR("o", "r", 1)
-	timed := e.start("wait", "o/r#1", "--for", "merged", "--timeout", "6s")
+	// Taken before the start: the waiter's deadline runs from when it
+	// starts, which may be before start returns.
 	timedStart := time.Now()
+	timed := e.start("wait", "o/r#1", "--for", "merged", "--timeout", "6s")
 	w := e.start("wait", "o/r#1", "--for", "merged")
 	ev := e.start("events", "--pr", "o/r#1", "--json")
 	e.waitWatched(1, 3)

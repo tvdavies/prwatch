@@ -63,10 +63,12 @@ var ErrNoBinary = errors.New("no usable prwatch binary to start the daemon from"
 // reports the protocol version this client speaks.
 //
 // The check is skipped for the binary this process was started from while
-// it is still the same file, which needs no exec.
-func ResolveExecutable() (Resolved, error) {
+// it is still the same executable file, which needs no exec. Checks stop
+// when ctx is done.
+func ResolveExecutable(ctx context.Context) (Resolved, error) {
 	exe, err := os.Executable()
 	return resolver{
+		ctx:      ctx,
 		exe:      exe,
 		exeErr:   err,
 		getenv:   os.Getenv,
@@ -99,15 +101,17 @@ func isSelf(path string) bool {
 		return false
 	}
 	fi, err := os.Stat(path)
-	return err == nil && os.SameFile(fi, self) && fi.Size() == self.Size() && fi.ModTime().Equal(self.ModTime())
+	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0 &&
+		os.SameFile(fi, self) && fi.Size() == self.Size() && fi.ModTime().Equal(self.ModTime())
 }
 
 type resolver struct {
+	ctx      context.Context
 	exe      string
 	exeErr   error
 	getenv   func(string) string
 	lookPath func(string) (string, error)
-	check    func(path string) (protocol.BinaryInfo, error)
+	check    func(ctx context.Context, path string) (protocol.BinaryInfo, error)
 	self     func(path string) bool // nil: never
 }
 
@@ -117,8 +121,16 @@ const deletedSuffix = " (deleted)"
 
 func (r resolver) resolve() (Resolved, error) {
 	var res Resolved
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	try := func(via, path string) bool {
-		info, err := r.check(path)
+		if err := ctx.Err(); err != nil {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("%s %s: not checked: %v", via, path, err))
+			return false
+		}
+		info, err := r.check(ctx, path)
 		if err != nil {
 			res.Skipped = append(res.Skipped, fmt.Sprintf("%s %s: %v", via, path, err))
 			return false
@@ -220,8 +232,9 @@ func npmLauncher(path string) string {
 }
 
 // CheckBinary checks that path is an executable prwatch that speaks this
-// client's protocol, by running `path version --json`.
-func CheckBinary(path string) (protocol.BinaryInfo, error) {
+// client's protocol, by running `path version --json`. It gives up after
+// 10s, or sooner if ctx is done.
+func CheckBinary(ctx context.Context, path string) (protocol.BinaryInfo, error) {
 	var info protocol.BinaryInfo
 	fi, err := os.Stat(path)
 	switch {
@@ -234,11 +247,13 @@ func CheckBinary(path string) (protocol.BinaryInfo, error) {
 	case fi.Mode().Perm()&0o111 == 0:
 		return info, errors.New("not executable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "version", "--json")
 	var out bytes.Buffer
 	cmd.Stdout = &out
+	// Don't wait on grandchildren holding stdout once the check is killed.
+	cmd.WaitDelay = time.Second
 	if err := cmd.Run(); err != nil {
 		return info, fmt.Errorf("version --json: %w", err)
 	}

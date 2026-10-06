@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -92,11 +93,23 @@ type result struct {
 	code           int
 }
 
+// textBusyRetries bounds retries of an exec that fails with ETXTBSY. A test
+// that has just written an executable can see that when another test forks
+// while the file is still open for writing (golang/go#22315).
+const textBusyRetries = 50
+
 func (e *env) run(args ...string) result {
-	c := e.cmd(args...)
 	var out, errb bytes.Buffer
-	c.Stdout, c.Stderr = &out, &errb
-	err := c.Run()
+	var err error
+	for i := 0; ; i++ {
+		c := e.cmd(args...)
+		c.Stdout, c.Stderr = &out, &errb
+		err = c.Run()
+		if !errors.Is(err, syscall.ETXTBSY) || i == textBusyRetries {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
 		code = ee.ExitCode()
@@ -132,10 +145,18 @@ func (s *syncBuf) String() string {
 
 func (e *env) start(args ...string) *proc {
 	e.t.Helper()
-	p := &proc{cmd: e.cmd(args...), out: &syncBuf{}, errb: &syncBuf{}, done: make(chan result, 1)}
-	p.cmd.Stdout, p.cmd.Stderr = p.out, p.errb
-	if err := p.cmd.Start(); err != nil {
-		e.t.Fatal(err)
+	p := &proc{out: &syncBuf{}, errb: &syncBuf{}, done: make(chan result, 1)}
+	for i := 0; ; i++ {
+		p.cmd = e.cmd(args...)
+		p.cmd.Stdout, p.cmd.Stderr = p.out, p.errb
+		err := p.cmd.Start()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.ETXTBSY) || i == textBusyRetries {
+			e.t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	go func() {
 		err := p.cmd.Wait()

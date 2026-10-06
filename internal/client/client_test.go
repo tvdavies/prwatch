@@ -1,12 +1,14 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tvdavies/prwatch/internal/protocol"
 )
@@ -27,7 +29,7 @@ func fakeResolver(exe string, env map[string]string, onPath string, good ...stri
 			}
 			return filepath.Join(onPath, name), nil
 		},
-		check: func(p string) (protocol.BinaryInfo, error) {
+		check: func(_ context.Context, p string) (protocol.BinaryInfo, error) {
 			if ok[p] {
 				return protocol.BinaryInfo{Version: "v-" + filepath.Base(filepath.Dir(p)), Protocol: protocol.Version}, nil
 			}
@@ -153,7 +155,7 @@ func TestCheckBinary(t *testing.T) {
 		{"missing", filepath.Join(dir, "missing"), "", "not found"},
 	}
 	for _, c := range cases {
-		info, err := CheckBinary(c.path)
+		info, err := CheckBinary(context.Background(), c.path)
 		switch {
 		case c.err == "" && (err != nil || info.Version != c.version || info.Protocol != protocol.Version):
 			t.Errorf("%s: got %+v, %v; want version %s", c.name, info, err, c.version)
@@ -212,6 +214,21 @@ func TestResolveSelf(t *testing.T) {
 	if !isSelf(running) {
 		t.Fatalf("isSelf(%s) is false for the running binary", running)
 	}
+	// The same file, no longer executable, is not used unchecked.
+	fi, err := os.Stat(running)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(running, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notExec := isSelf(running)
+	if err := os.Chmod(running, fi.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+	if notExec {
+		t.Fatal("isSelf is true for the running binary with its execute bits removed")
+	}
 	copied := filepath.Join(t.TempDir(), "prwatch")
 	b, err := os.ReadFile(running)
 	if err != nil {
@@ -222,5 +239,56 @@ func TestResolveSelf(t *testing.T) {
 	}
 	if isSelf(copied) {
 		t.Fatal("isSelf is true for a copy")
+	}
+}
+
+// Checking candidates stops at the caller's deadline, however slow a
+// candidate is, and later candidates are not run.
+func TestResolveHonoursDeadline(t *testing.T) {
+	dir := t.TempDir()
+	slow := writeScript(t, dir, "slow", "exec sleep 30", 0o755)
+	pathDir := filepath.Join(dir, "path")
+	_ = os.Mkdir(pathDir, 0o755)
+	writeScript(t, pathDir, "prwatch", "exec sleep 30", 0o755)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	r := resolver{ctx: ctx, exe: filepath.Join(dir, "gone"), check: CheckBinary,
+		getenv:   func(k string) string { return map[string]string{"PRWATCH_BIN": slow}[k] },
+		lookPath: func(string) (string, error) { return filepath.Join(pathDir, "prwatch"), nil }}
+	start := time.Now()
+	_, err := r.resolve()
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("resolve took %s with a 300ms deadline", took)
+	}
+	if !errors.Is(err, ErrNoBinary) || !strings.Contains(err.Error(), "PATH "+filepath.Join(pathDir, "prwatch")+": not checked: context deadline exceeded") {
+		t.Fatalf("error %v", err)
+	}
+}
+
+// While a daemon this process started is still alive, DialUntil does not
+// start another, even in a later call.
+func TestNoSpawnWhileChildAlive(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "pwc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	alive := make(chan struct{})
+	childMu.Lock()
+	saved := child
+	child = alive
+	childMu.Unlock()
+	defer func() {
+		childMu.Lock()
+		child = saved
+		childMu.Unlock()
+	}()
+	for range 2 {
+		if _, err := DialUntil(dir, true, time.Now().Add(700*time.Millisecond)); !errors.Is(err, ErrDeadline) {
+			t.Fatalf("DialUntil: %v, want ErrDeadline", err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "daemon.log")); !os.IsNotExist(err) {
+		t.Fatalf("a daemon was started while the last one was alive (daemon.log: %v)", err)
 	}
 }
