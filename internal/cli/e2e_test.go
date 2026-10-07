@@ -614,6 +614,8 @@ func TestUsageErrorsExit2(t *testing.T) {
 		{"wait", "not a pr"},
 		{"status", "not a pr"},
 		{"events", "--pr", "not a pr"},
+		{"events", "--pr", ""},
+		{"events", "--pr", ",,"},
 		{"bogus"},
 	} {
 		if r := e.run(args...); r.code != 2 {
@@ -737,6 +739,15 @@ func TestStatusReportsBadReferencesAndPrintsTheRest(t *testing.T) {
 	r = e.run("status", "--json", "440#infrastructure", "not a pr")
 	if r.code != 2 || r.stdout != "" {
 		t.Fatalf("no valid reference: exit %d, stdout %q", r.code, r.stdout)
+	}
+}
+
+func TestStatusReportsBadReferencesWhenTheFetchFails(t *testing.T) {
+	e := newEnv(t, "GH_TOKEN=bad-token")
+	e.fake.AddPR("o", "r", 1)
+	r := e.run("status", "440#infrastructure", "o/r#1")
+	if r.code != 2 || !strings.Contains(r.stderr, `"440#infrastructure"`) {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
 	}
 }
 

@@ -532,6 +532,10 @@ func cmdStatus(args []string, version string) int {
 	if len(refs) == 0 {
 		return usageErr("%v", bad[0])
 	}
+	// Reported first, so a failure of the whole fetch doesn't hide them.
+	for _, err := range bad {
+		fmt.Fprintln(Stderr, "prwatch:", err)
+	}
 	dir, err := stateDir()
 	if err != nil {
 		return fail(err)
@@ -544,8 +548,7 @@ func cmdStatus(args []string, version string) int {
 		return fail(err)
 	}
 	code := ExitOK
-	for _, err := range bad {
-		fmt.Fprintln(Stderr, "prwatch:", err)
+	if len(bad) > 0 {
 		code = ExitError
 	}
 	var snaps []*snapshot.Snapshot
@@ -744,10 +747,14 @@ func cmdEvents(args []string) int {
 	if err != nil {
 		return flagError(fs, err, eventsHelp)
 	}
-	given := append(prs, pos...)
-	refs, bad := parseSomeRefs(given)
-	if len(given) > 0 && len(refs) == 0 {
-		// Never widen a stream on bad PRs to every PR.
+	prGiven := len(pos) > 0
+	fs.Visit(func(f *flag.Flag) { prGiven = prGiven || f.Name == "pr" })
+	refs, bad := parseSomeRefs(append(prs, pos...))
+	if prGiven && len(refs) == 0 {
+		// Never widen a stream on bad or empty PRs to every PR.
+		if len(bad) == 0 {
+			return usageErr("events: --pr names no PR\n\n%s", eventsHelp)
+		}
 		return usageErr("%v", bad[0])
 	}
 	for _, err := range bad {
