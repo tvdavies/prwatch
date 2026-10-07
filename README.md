@@ -217,6 +217,7 @@ The values come from GitHub's GraphQL API:
 | `unresolved_threads` | at least one review thread is unresolved |
 | `conflict` | `mergeable` is `CONFLICTING` |
 | `ready_auto_merge_off` | approved, green, no unresolved threads and mergeable, but auto-merge is off |
+| `merge_blocked` | approved, checks passed, no unresolved threads and no conflict, yet GitHub reports `BLOCKED`: something outside the snapshot blocks the merge, typically a required check that never reported. Applies with or without auto-merge, which wouldn't fire either. A head with no checks yet doesn't count, since required checks may simply not have started. |
 
 `token` is `1.<16 hex>.<8 hex>`:
 - the first hash covers every material field: state, draft, merge commit, head and base, title, mergeability, auto-merge, review decision, reviews, review requests, threads, checks, comment count and [edits](#edits);

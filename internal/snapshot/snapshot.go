@@ -146,6 +146,7 @@ const (
 	ReasonUnresolvedThreads   = "unresolved_threads"
 	ReasonConflict            = "conflict"
 	ReasonReadyAutoMergeOff   = "ready_auto_merge_off"
+	ReasonMergeBlocked        = "merge_blocked"
 )
 
 // Finalise normalises slices, computes reasons, needsAction and the token.
@@ -222,7 +223,22 @@ func computeReasons(s *Snapshot) []string {
 	if Ready(s) && !s.AutoMerge.Enabled {
 		reasons = append(reasons, ReasonReadyAutoMergeOff)
 	}
+	if MergeBlocked(s) {
+		reasons = append(reasons, ReasonMergeBlocked)
+	}
 	return reasons
+}
+
+// MergeBlocked reports whether GitHub blocks the merge of an open PR that is
+// approved, has passing checks, no unresolved threads and no conflict: the
+// block comes from something not in the snapshot, typically a required check
+// that never reported. Auto-merge doesn't help, so it applies either way.
+// It needs checks that passed, not merely none: just after a push, required
+// checks may not exist yet and GitHub briefly reports BLOCKED.
+func MergeBlocked(s *Snapshot) bool {
+	return !s.Incomplete && s.State == "OPEN" && !s.IsDraft && Approved(s) && !ChangesRequested(s) &&
+		s.Checks.State == "SUCCESS" && s.Threads.Unresolved == 0 && !s.Threads.Truncated &&
+		s.Mergeable == "MERGEABLE" && s.MergeStateStatus == "BLOCKED"
 }
 
 // ChecksSettled reports whether the rollup has left PENDING. A head commit
