@@ -235,6 +235,21 @@ func parseRefs(args []string) ([]prref.Ref, error) {
 	return refs, nil
 }
 
+// parseSomeRefs parses each argument on its own, so that one bad reference
+// doesn't take the valid ones down with it. bad holds the parse errors in
+// argument order.
+func parseSomeRefs(args []string) (refs []prref.Ref, bad []error) {
+	for _, a := range args {
+		r, err := prref.Parse(a, RemoteFunc)
+		if err != nil {
+			bad = append(bad, err)
+			continue
+		}
+		refs = append(refs, r)
+	}
+	return refs, bad
+}
+
 func stateDir() (string, error) { return paths.StateDir() }
 
 const waitHelp = `Usage: prwatch wait <pr> [--for COND] [--since TOKEN] [--timeout DURATION] [--json]
@@ -303,7 +318,7 @@ func cmdWait(args []string) int {
 			fmt.Fprint(Stdout, snapshot.Format(s))
 		}
 	}
-	code, done := stream(dir, protocol.Request{Op: protocol.OpWait, PRs: []string{refs[0].String()}, For: *forCond}, deadline,
+	code, done := stream(dir, &protocol.Request{Op: protocol.OpWait, PRs: []string{refs[0].String()}, For: *forCond}, deadline, nil,
 		func(m protocol.Message) (int, bool) {
 			if m.Type != protocol.TypeSnapshot || m.Snapshot == nil {
 				return 0, false
@@ -327,7 +342,12 @@ func cmdWait(args []string) int {
 // feeds snapshot messages to handle until it reports done. It returns
 // done=false when the deadline (zero for none) passes, including while
 // connecting.
-func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(protocol.Message) (int, bool)) (int, bool) {
+//
+// A per-PR error ends the subscription unless onPRError is set: then the
+// error is printed, onPRError gets it with its exit code, and the stream
+// carries on unless it reports done. req is re-sent on every reconnect, so
+// onPRError may change it.
+func stream(dir string, req *protocol.Request, deadlineAt time.Time, onPRError func(protocol.Message, int) (int, bool), handle func(protocol.Message) (int, bool)) (int, bool) {
 	var deadline <-chan time.Time
 	if !deadlineAt.IsZero() {
 		t := time.NewTimer(time.Until(deadlineAt))
@@ -375,7 +395,7 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 			fmt.Fprintf(Stderr, "prwatch: reconnected to daemon pid %d (version %s)\n", conn.Hello.PID, conn.Hello.Version)
 			outage, attempts = nil, 0
 		}
-		if err := conn.Send(req); err != nil {
+		if err := conn.Send(*req); err != nil {
 			conn.Close()
 			failures++
 			if failures > 5 {
@@ -411,15 +431,23 @@ func stream(dir string, req protocol.Request, deadlineAt time.Time, handle func(
 			case m := <-msgs:
 				switch m.Type {
 				case protocol.TypeError:
-					conn.Close()
 					fmt.Fprintln(Stderr, "prwatch:", m.Message)
+					code := ExitError
 					switch m.Code {
 					case protocol.CodeNotFound:
-						return ExitNotFound, true
+						code = ExitNotFound
 					case protocol.CodeAuth, protocol.CodeBadRequest:
-						return ExitUsage, true
+						code = ExitUsage
 					}
-					return ExitError, true
+					if m.PR != "" && onPRError != nil {
+						c, done := onPRError(m, code)
+						if !done {
+							continue
+						}
+						code = c
+					}
+					conn.Close()
+					return code, true
 				case protocol.TypeShutdown:
 					// After a restart or an idle exit, reconnect: the first
 					// client back starts a new daemon. The handler keeps its
@@ -483,6 +511,11 @@ const statusHelp = `Usage: prwatch status <pr...> [--json]
 
 Prints PR snapshots from the daemon cache if a daemon is running, otherwise
 with one direct batched request. Does not start a daemon.
+
+Each PR that fails (not found, unreadable, incomplete, or not a PR reference
+at all) is reported on stderr and the others are still printed; the exit
+code is then that of the first failure, 1 for a bad reference. Exits 2
+without printing anything when no argument is a PR reference.
 `
 
 func cmdStatus(args []string, version string) int {
@@ -495,9 +528,13 @@ func cmdStatus(args []string, version string) int {
 	if len(pos) == 0 {
 		return usageErr("status needs at least one PR\n\n%s", statusHelp)
 	}
-	refs, err := parseRefs(pos)
-	if err != nil {
-		return usageErr("%v", err)
+	refs, bad := parseSomeRefs(pos)
+	if len(refs) == 0 {
+		return usageErr("%v", bad[0])
+	}
+	// Reported first, so a failure of the whole fetch doesn't hide them.
+	for _, err := range bad {
+		fmt.Fprintln(Stderr, "prwatch:", err)
 	}
 	dir, err := stateDir()
 	if err != nil {
@@ -511,6 +548,9 @@ func cmdStatus(args []string, version string) int {
 		return fail(err)
 	}
 	code := ExitOK
+	if len(bad) > 0 {
+		code = ExitError
+	}
 	var snaps []*snapshot.Snapshot
 	for _, r := range refs {
 		res, ok := results[r.Key()]
@@ -686,8 +726,16 @@ func statusDirect(dir string, refs []prref.Ref, version string) (map[string]stat
 const eventsHelp = `Usage: prwatch events [--pr <pr>]... [--json]
 
 Streams one line per PR change (JSON Lines with --json) until interrupted.
-Without --pr it streams changes to every PR the daemon is watching. An
-events stream counts as a waiter and keeps the daemon alive.
+Each --pr PR first gets an "initial" line with its current state, so a
+change made before the stream started is never missed. Without --pr it
+streams every PR the daemon is watching, starting with an "initial" line
+for each one it already has.
+
+A --pr that isn't a PR reference is reported on stderr and skipped; with
+none valid, events exits 2. A PR that can't be read (not found, say) is
+reported on stderr, and as a {"type":"error"} line with --json, and the
+stream carries on with the others; it exits with that PR's code once no
+PR is left. An events stream counts as a waiter and keeps the daemon alive.
 `
 
 func cmdEvents(args []string) int {
@@ -699,9 +747,18 @@ func cmdEvents(args []string) int {
 	if err != nil {
 		return flagError(fs, err, eventsHelp)
 	}
-	refs, err := parseRefs(append(prs, pos...))
-	if err != nil {
-		return usageErr("%v", err)
+	prGiven := len(pos) > 0
+	fs.Visit(func(f *flag.Flag) { prGiven = prGiven || f.Name == "pr" })
+	refs, bad := parseSomeRefs(append(prs, pos...))
+	if prGiven && len(refs) == 0 {
+		// Never widen a stream on bad or empty PRs to every PR.
+		if len(bad) == 0 {
+			return usageErr("events: --pr names no PR\n\n%s", eventsHelp)
+		}
+		return usageErr("%v", bad[0])
+	}
+	for _, err := range bad {
+		fmt.Fprintln(Stderr, "prwatch: warning: skipping:", err)
 	}
 	dir, err := stateDir()
 	if err != nil {
@@ -711,12 +768,42 @@ func cmdEvents(args []string) int {
 	for _, r := range refs {
 		names = append(names, r.String())
 	}
+	req := protocol.Request{Op: protocol.OpEvents, PRs: names}
 	// The last state printed for each PR. After a reconnect (a daemon
 	// restart, say) the new daemon sends each PR's state as "initial": that
 	// is suppressed when nothing changed, and reported as a change against
 	// what was last printed when something did.
 	printed := map[string]*snapshot.Snapshot{}
-	code, _ := stream(dir, protocol.Request{Op: protocol.OpEvents, PRs: names}, time.Time{}, func(m protocol.Message) (int, bool) {
+	// A PR that can't be read leaves the stream; the others carry on. It is
+	// dropped from the request too, so a reconnect doesn't ask for it again.
+	onPRError := func(m protocol.Message, code int) (int, bool) {
+		if *asJSON {
+			b, _ := json.Marshal(struct {
+				Type    string    `json:"type"`
+				Time    time.Time `json:"time"`
+				PR      string    `json:"pr"`
+				Code    string    `json:"code"`
+				Message string    `json:"message"`
+			}{"error", time.Now().UTC().Truncate(time.Second), m.PR, m.Code, m.Message})
+			fmt.Fprintln(Stdout, string(b))
+		}
+		if len(req.PRs) == 0 {
+			// A stream on every PR: nothing to drop.
+			return 0, false
+		}
+		kept := req.PRs[:0]
+		for _, p := range req.PRs {
+			if !strings.EqualFold(p, m.PR) {
+				kept = append(kept, p)
+			}
+		}
+		req.PRs = kept
+		if len(req.PRs) == 0 {
+			return code, true
+		}
+		return 0, false
+	}
+	code, _ := stream(dir, &req, time.Time{}, onPRError, func(m protocol.Message) (int, bool) {
 		if m.Snapshot == nil {
 			return 0, false
 		}

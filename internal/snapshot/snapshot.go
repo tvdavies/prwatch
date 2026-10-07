@@ -199,13 +199,18 @@ func computeReasons(s *Snapshot) []string {
 			otherFailed = true
 		}
 	}
+	// Only the first 100 contexts are fetched: a failed rollup with no failed
+	// context in view still means a check failed.
+	if !reqFailed && !otherFailed && (s.Checks.State == "FAILURE" || s.Checks.State == "ERROR") {
+		otherFailed = true
+	}
 	if reqFailed {
 		reasons = append(reasons, ReasonRequiredCheckFailed)
 	}
 	if otherFailed {
 		reasons = append(reasons, ReasonCheckFailed)
 	}
-	if s.ReviewDecision != nil && *s.ReviewDecision == "CHANGES_REQUESTED" {
+	if ChangesRequested(s) {
 		reasons = append(reasons, ReasonChangesRequested)
 	}
 	if s.Threads.Unresolved > 0 {
@@ -228,6 +233,22 @@ func ChecksSettled(s *Snapshot) bool {
 
 // Green reports whether the rollup succeeded, or there are no checks.
 func Green(s *Snapshot) bool { return s.Checks.State == "SUCCESS" || s.Checks.State == "NONE" }
+
+// ChangesRequested reports whether the review decision is CHANGES_REQUESTED
+// or any reviewer's latest review requests changes. The second covers repos
+// and branches with no required review, where the decision is null, and
+// reviewers whose request doesn't count towards the decision.
+func ChangesRequested(s *Snapshot) bool {
+	if s.ReviewDecision != nil && *s.ReviewDecision == "CHANGES_REQUESTED" {
+		return true
+	}
+	for _, r := range s.Reviews {
+		if r.State == "CHANGES_REQUESTED" {
+			return true
+		}
+	}
+	return false
+}
 
 // Approved reports whether the PR is approved, or needs no review.
 func Approved(s *Snapshot) bool {
