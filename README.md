@@ -102,8 +102,8 @@ A `<pr>` can be:
 | Command | What it does |
 | --- | --- |
 | `prwatch wait <pr> [--for COND] [--since TOKEN] [--timeout D] [--json]` | Block until the condition holds, then print the snapshot and its token. |
-| `prwatch status <pr...> [--json]` | Print snapshots: from the daemon's cache if it is running, otherwise from one direct batched request. Never starts the daemon. |
-| `prwatch events [--pr <pr>]... [--json]` | Stream one line per change (JSON Lines with `--json`). Without `--pr`, streams every watched PR. Counts as a waiter. |
+| `prwatch status <pr...> [--json]` | Print snapshots: from the daemon's cache if it is running, otherwise from one direct batched request. Never starts the daemon. See [partial batches](#partial-batches). |
+| `prwatch events [--pr <pr>]... [--json]` | Stream one line per change (JSON Lines with `--json`), starting with each PR's [current state](#events-start-with-the-current-state). Without `--pr`, streams every watched PR. Counts as a waiter. |
 | `prwatch list [--json]` | Show what the daemon is watching, who is waiting and the budget. Never starts or keeps alive the daemon. |
 | `prwatch rate [--json]` | Show the remaining budget, last cost, poll interval and any back-off. |
 | `prwatch daemon status` / `stop` / `restart [--force]` | Inspect, stop or [restart](#upgrading) the daemon. |
@@ -129,6 +129,18 @@ Conflicts and base-branch moves are detected even when nothing on the PR itself 
 ### Edits
 
 Editing the PR description, an issue comment, a review body or a review-thread comment wakes `change` and appears in `events` as `description edited`, `comment edited` or `review edited`. Review and thread-comment edits also wake `review`. To keep each round cheap, only edits within the fetched window are seen: the newest 3 issue comments, the latest review from each reviewer, and the last 10 comments of each of the newest 5 review threads. Edits to older comments or threads are not seen.
+
+### Events start with the current state
+
+`events --pr` first prints an `initial` line for each PR with its state at subscribe time: from the daemon's cache when it's fresh, otherwise after the PR's first complete fetch. Every later line is a change against what was last printed. So a review or check that lands before the stream starts is still reported, as part of the `initial` state, and never silently becomes a baseline. Without `--pr`, the stream starts with an `initial` line for each PR the daemon already has a snapshot for.
+
+### Partial batches
+
+One bad PR doesn't hide the others:
+
+- `status` reports each failing PR on stderr and still prints the rest. That covers PRs that aren't found, can't be read or come back incomplete, and arguments that aren't PR references at all (`440#infrastructure`, say). The exit code is that of the first failure, and 1 for a bad reference. Only when no argument is a PR reference does `status` exit 2 without printing anything.
+- `events` skips a `--pr` that isn't a PR reference, with a warning on stderr. If none is valid it exits 2 rather than widening to every PR. A PR that can't be read (not found, say) is reported on stderr, and as a `{"type":"error","time","pr","code","message"}` line with `--json`, and the stream carries on with the others. Once no PR is left, it exits with that PR's code.
+- `wait` takes exactly one PR, so a bad reference is a usage error (exit 2).
 
 ### Exit codes
 
@@ -200,8 +212,8 @@ The values come from GitHub's GraphQL API:
 | Reason | Meaning |
 | --- | --- |
 | `required_check_failed` | a required check failed, timed out, was cancelled or needs action |
-| `check_failed` | a non-required check failed |
-| `changes_requested` | the review decision is `CHANGES_REQUESTED` |
+| `check_failed` | a non-required check failed, or the rollup is `FAILURE`/`ERROR` with no failed check among the 100 fetched |
+| `changes_requested` | the review decision is `CHANGES_REQUESTED`, or any reviewer's latest review requests changes (this also covers branches with no required review, where the decision is null) |
 | `unresolved_threads` | at least one review thread is unresolved |
 | `conflict` | `mergeable` is `CONFLICTING` |
 | `ready_auto_merge_off` | approved, green, no unresolved threads and mergeable, but auto-merge is off |

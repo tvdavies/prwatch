@@ -612,6 +612,8 @@ func TestUsageErrorsExit2(t *testing.T) {
 		{"wait", "o/r#1", "--for", "nonsense"},
 		{"wait", "o/r#1", "--since", "garbage"},
 		{"wait", "not a pr"},
+		{"status", "not a pr"},
+		{"events", "--pr", "not a pr"},
 		{"bogus"},
 	} {
 		if r := e.run(args...); r.code != 2 {
@@ -710,6 +712,58 @@ func TestEventsStream(t *testing.T) {
 	l := e.run("list")
 	if !strings.Contains(l.stdout, "1 stream") || !strings.Contains(l.stdout, "1 events stream on all PRs") {
 		t.Fatalf("list:\n%s", l.stdout)
+	}
+	// The --pr stream started with the state at subscribe time, so a change
+	// made before it started is never lost.
+	if first, _, _ := strings.Cut(ev.out.String(), "\n"); !strings.Contains(first, "o/r#1: initial") {
+		t.Fatalf("first events line %q, want the initial state", first)
+	}
+}
+
+func TestStatusReportsBadReferencesAndPrintsTheRest(t *testing.T) {
+	e := newEnv(t)
+	e.fake.AddPR("o", "r", 1)
+	e.fake.AddPR("o", "r", 2)
+
+	r := e.run("status", "--json", "o/r#1", "440#infrastructure", "o/r#2")
+	if r.code != 1 || !strings.Contains(r.stderr, `"440#infrastructure"`) {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+	var snaps []snapshot.Snapshot
+	if err := json.Unmarshal([]byte(r.stdout), &snaps); err != nil || len(snaps) != 2 || snaps[0].PR != "o/r#1" || snaps[1].PR != "o/r#2" {
+		t.Fatalf("status json %q: %v", r.stdout, err)
+	}
+
+	r = e.run("status", "--json", "440#infrastructure", "not a pr")
+	if r.code != 2 || r.stdout != "" {
+		t.Fatalf("no valid reference: exit %d, stdout %q", r.code, r.stdout)
+	}
+}
+
+func TestEventsSkipsBadAndUnreadablePRs(t *testing.T) {
+	e := newEnv(t)
+	k := e.fake.AddPR("o", "r", 1)
+	e.fake.Update(k, func(p *github.RawPR) { fakegh.SetChecks(p, "PENDING") })
+
+	if r := e.run("events", "--pr", "440#infrastructure"); r.code != 2 {
+		t.Fatalf("events with no valid PR: exit %d, want 2 (never a stream on every PR)", r.code)
+	}
+
+	ev := e.start("events", "--json", "--pr", "440#infrastructure", "--pr", "o/r#99", "--pr", "o/r#1")
+	eventually(t, 5*time.Second, "an error line for the missing PR", func() bool {
+		return strings.Contains(ev.out.String(), `"type":"error","time"`) && strings.Contains(ev.out.String(), `"pr":"o/r#99"`)
+	})
+	e.fake.Update(k, func(p *github.RawPR) { fakegh.SetChecks(p, "SUCCESS") })
+	eventually(t, 5*time.Second, "the valid PR's change", func() bool {
+		return strings.Contains(ev.out.String(), `"changes":["checks PENDING→SUCCESS"]`)
+	})
+	if !ev.running() || !strings.Contains(ev.errb.String(), `skipping`) {
+		t.Fatalf("running %v, stderr %q", ev.running(), ev.errb.String())
+	}
+
+	only := e.start("events", "--pr", "o/r#98")
+	if r := only.wait(t, 5*time.Second); r.code != 3 {
+		t.Fatalf("events whose only PR is missing: exit %d, want 3", r.code)
 	}
 }
 

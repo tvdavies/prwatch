@@ -98,6 +98,14 @@ func TestReasons(t *testing.T) {
 			s.AutoMerge.Enabled = true
 		}, []string{ReasonCheckFailed}},
 		{"changes requested", func(s *Snapshot) { s.ReviewDecision = str("CHANGES_REQUESTED") }, []string{ReasonChangesRequested}},
+		{"changes requested with no review decision", func(s *Snapshot) {
+			s.Reviews = []Review{{Author: "bob", State: "CHANGES_REQUESTED"}}
+			s.AutoMerge.Enabled = true
+		}, []string{ReasonChangesRequested}},
+		{"failed rollup with no failed context in view", func(s *Snapshot) {
+			s.Checks.State = "FAILURE"
+			s.Checks.Total = 150
+		}, []string{ReasonCheckFailed}},
 		{"unresolved threads", func(s *Snapshot) {
 			s.Threads.Items = []Thread{{ID: "t"}}
 			s.Threads.Unresolved = 1
