@@ -113,6 +113,13 @@ func TestReasons(t *testing.T) {
 		{"conflict", func(s *Snapshot) { s.Mergeable = "CONFLICTING"; s.MergeStateStatus = "DIRTY" }, []string{ReasonConflict}},
 		{"review required is not ready", func(s *Snapshot) { s.ReviewDecision = str("REVIEW_REQUIRED") }, []string{}},
 		{"draft is not ready", func(s *Snapshot) { s.IsDraft = true }, []string{}},
+		{"approved and green but blocked", func(s *Snapshot) { s.MergeStateStatus = "BLOCKED" }, []string{ReasonMergeBlocked}},
+		{"blocked with auto-merge on", func(s *Snapshot) { s.MergeStateStatus = "BLOCKED"; s.AutoMerge.Enabled = true }, []string{ReasonMergeBlocked}},
+		{"blocked just after a push, no checks yet", func(s *Snapshot) {
+			s.MergeStateStatus = "BLOCKED"
+			s.Checks = Checks{State: "NONE"}
+		}, []string{}},
+		{"blocked awaiting review", func(s *Snapshot) { s.MergeStateStatus = "BLOCKED"; s.ReviewDecision = str("REVIEW_REQUIRED") }, []string{}},
 		{"merged needs nothing", func(s *Snapshot) { s.State = "MERGED"; s.Merged = true; s.Mergeable = "CONFLICTING" }, []string{}},
 	}
 	for _, c := range cases {
