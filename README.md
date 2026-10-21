@@ -169,6 +169,7 @@ One bad PR doesn't hide the others:
   "headRefOid": "4b1c…", "baseRefName": "main",
   "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
   "autoMerge": { "enabled": false, "method": null },
+  "mergeQueue": null,
   "reviewDecision": "APPROVED",
   "reviews": [{ "author": "alice", "state": "APPROVED", "submittedAt": "…", "commit": "4b1c…", "editedAt": null }],
   "reviewCount": 3,
@@ -197,6 +198,7 @@ The values come from GitHub's GraphQL API:
 - `state` is `OPEN`, `CLOSED` or `MERGED`.
 - `checks.state` is GitHub's rollup state, or `NONE` when the head commit has no checks.
 - `checks.contexts[].kind` is `check_run` or `status`. `required` is null if GitHub can't tell.
+- `mergeQueue` is the PR's merge queue entry, `{ "position": 1, "state": "AWAITING_CHECKS", "enqueuedAt": "…" }`, or null when it isn't queued. `position` 1 is next to merge; `state` is GitHub's `QUEUED`, `AWAITING_CHECKS`, `MERGEABLE`, `UNMERGEABLE` or `LOCKED`. A merge queue enqueues a PR without an auto-merge request, so `autoMerge.enabled` can be false for a queued PR.
 - `reviewDecision` is null when no review policy applies.
 - `reviews` holds the latest review from each author.
 - `reviewCount` counts every review, including replies in threads.
@@ -216,11 +218,11 @@ The values come from GitHub's GraphQL API:
 | `changes_requested` | the review decision is `CHANGES_REQUESTED`, or any reviewer's latest review requests changes (this also covers branches with no required review, where the decision is null) |
 | `unresolved_threads` | at least one review thread is unresolved |
 | `conflict` | `mergeable` is `CONFLICTING` |
-| `ready_auto_merge_off` | approved, green, no unresolved threads and mergeable, but auto-merge is off |
+| `ready_auto_merge_off` | approved, green, no unresolved threads and mergeable, but auto-merge is off and it isn't in a merge queue |
 | `merge_blocked` | approved, checks passed, no unresolved threads and no conflict, yet GitHub reports `BLOCKED`: something outside the snapshot blocks the merge, typically a required check that never reported. Applies with or without auto-merge, which wouldn't fire either. A head with no checks yet doesn't count, since required checks may simply not have started. |
 
 `token` is `1.<16 hex>.<8 hex>`:
-- the first hash covers every material field: state, draft, merge commit, head and base, title, mergeability, auto-merge, review decision, reviews, review requests, threads, checks, comment count and [edits](#edits);
+- the first hash covers every material field: state, draft, merge commit, head and base, title, mergeability, auto-merge, merge queue membership and state (not position, which moves whenever an entry ahead merges), review decision, reviews, review requests, threads, checks, comment count and [edits](#edits);
 - the second covers reviews and threads only, including review and thread-comment edits.
 
 A PR on which nothing has been edited keeps the same token as in 0.1.0.

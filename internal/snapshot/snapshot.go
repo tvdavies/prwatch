@@ -34,14 +34,17 @@ type Snapshot struct {
 	Mergeable        string     `json:"mergeable"`
 	MergeStateStatus string     `json:"mergeStateStatus"`
 	AutoMerge        AutoMerge  `json:"autoMerge"`
-	ReviewDecision   *string    `json:"reviewDecision"`
-	Reviews          []Review   `json:"reviews"`
-	ReviewCount      int        `json:"reviewCount"`
-	ReviewRequests   []string   `json:"reviewRequests"`
-	Threads          Threads    `json:"threads"`
-	Checks           Checks     `json:"checks"`
-	Comments         Comments   `json:"comments"`
-	UpdatedAt        time.Time  `json:"updatedAt"`
+	// MergeQueue is the PR's merge queue entry, or null when it isn't queued.
+	// A merge queue enqueues a PR without an auto-merge request.
+	MergeQueue     *MergeQueue `json:"mergeQueue"`
+	ReviewDecision *string     `json:"reviewDecision"`
+	Reviews        []Review    `json:"reviews"`
+	ReviewCount    int         `json:"reviewCount"`
+	ReviewRequests []string    `json:"reviewRequests"`
+	Threads        Threads     `json:"threads"`
+	Checks         Checks      `json:"checks"`
+	Comments       Comments    `json:"comments"`
+	UpdatedAt      time.Time   `json:"updatedAt"`
 	// BodyEditedAt is when the PR description was last edited, or null.
 	BodyEditedAt *time.Time `json:"bodyEditedAt"`
 	NeedsAction  bool       `json:"needsAction"`
@@ -59,6 +62,16 @@ type Snapshot struct {
 type AutoMerge struct {
 	Enabled bool    `json:"enabled"`
 	Method  *string `json:"method"`
+}
+
+// MergeQueue is a PR's entry in its base branch's merge queue.
+type MergeQueue struct {
+	// Position is 1 for the entry next to merge.
+	Position int `json:"position"`
+	// State is GitHub's MergeQueueEntryState: QUEUED, AWAITING_CHECKS,
+	// MERGEABLE, UNMERGEABLE or LOCKED.
+	State      string     `json:"state"`
+	EnqueuedAt *time.Time `json:"enqueuedAt"`
 }
 
 // Review is the latest review by one author.
@@ -220,7 +233,7 @@ func computeReasons(s *Snapshot) []string {
 	if s.Mergeable == "CONFLICTING" {
 		reasons = append(reasons, ReasonConflict)
 	}
-	if Ready(s) && !s.AutoMerge.Enabled {
+	if Ready(s) && !s.AutoMerge.Enabled && s.MergeQueue == nil {
 		reasons = append(reasons, ReasonReadyAutoMergeOff)
 	}
 	if MergeBlocked(s) {
@@ -333,6 +346,7 @@ type allMaterial struct {
 	MergeState  string   `json:"ms"`
 	AutoMerge   bool     `json:"am"`
 	AutoMethod  *string  `json:"amm"`
+	Queue       string   `json:"q,omitempty"`
 	Requests    []string `json:"rq"`
 	Checks      string   `json:"c"`
 	Contexts    []string `json:"cx"`
@@ -379,6 +393,7 @@ func ComputeToken(s *Snapshot) Token {
 		Head: s.HeadRefOid, Base: s.BaseRefName, Title: s.Title,
 		Mergeable: s.Mergeable, MergeState: s.MergeStateStatus,
 		AutoMerge: s.AutoMerge.Enabled, AutoMethod: s.AutoMerge.Method,
+		Queue:  queueMaterial(s.MergeQueue),
 		Checks: s.Checks.State, Comments: s.Comments.Total, Review: review,
 		Incomplete: s.Incomplete, BodyEdit: stamp(s.BodyEditedAt),
 	}
@@ -526,6 +541,9 @@ func Changes(prev, cur *Snapshot) []string {
 	}
 	if prev.AutoMerge.Enabled != cur.AutoMerge.Enabled {
 		out = append(out, fmt.Sprintf("auto-merge %s", onOff(cur.AutoMerge.Enabled)))
+	}
+	if queueMaterial(prev.MergeQueue) != queueMaterial(cur.MergeQueue) {
+		out = append(out, "merge queue "+queueText(cur.MergeQueue))
 	}
 	if prev.Comments.Total != cur.Comments.Total {
 		out = append(out, fmt.Sprintf("comments %+d", cur.Comments.Total-prev.Comments.Total))
@@ -692,8 +710,8 @@ func Format(s *Snapshot) string {
 			am += " (" + strings.ToLower(*s.AutoMerge.Method) + ")"
 		}
 	}
-	fmt.Fprintf(&b, "  review: %s  mergeable: %s/%s  auto-merge: %s\n",
-		orNone(deref(s.ReviewDecision)), s.Mergeable, s.MergeStateStatus, am)
+	fmt.Fprintf(&b, "  review: %s  mergeable: %s/%s  auto-merge: %s  merge queue: %s\n",
+		orNone(deref(s.ReviewDecision)), s.Mergeable, s.MergeStateStatus, am, queueText(s.MergeQueue))
 	if len(s.ReviewRequests) > 0 {
 		fmt.Fprintf(&b, "  review requested: %s\n", strings.Join(s.ReviewRequests, ", "))
 	}
@@ -726,4 +744,21 @@ func Excerpt(text string, n int) string {
 		return string(r[:n-1]) + "…"
 	}
 	return text
+}
+
+// queueMaterial is the part of a merge queue entry that counts as a change:
+// joining or leaving the queue and its state, not the position, which moves
+// whenever an entry ahead of it merges.
+func queueMaterial(q *MergeQueue) string {
+	if q == nil {
+		return ""
+	}
+	return q.State
+}
+
+func queueText(q *MergeQueue) string {
+	if q == nil {
+		return "no"
+	}
+	return fmt.Sprintf("#%d %s", q.Position, strings.ToLower(q.State))
 }
