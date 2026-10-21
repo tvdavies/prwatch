@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -186,6 +187,29 @@ func TestTruncatedThreads(t *testing.T) {
 		if r == "ready_auto_merge_off" {
 			t.Fatal("a PR with unseen threads must not be ready")
 		}
+	}
+}
+
+func TestMergeQueueEntry(t *testing.T) {
+	enqueued := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	p := &RawPR{State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"}
+	s := ToSnapshot(p, prref.Ref{Owner: "o", Repo: "r", Number: 1}, time.Now())
+	if !slices.Contains(s.Reasons, "ready_auto_merge_off") {
+		t.Fatalf("the same PR outside the queue must be ready without auto-merge: %v", s.Reasons)
+	}
+	p.MergeQueueEntry = &RawQueueEntry{Position: 2, State: "AWAITING_CHECKS", EnqueuedAt: &enqueued}
+	s = ToSnapshot(p, prref.Ref{Owner: "o", Repo: "r", Number: 1}, time.Now())
+	if s.MergeQueue == nil || s.MergeQueue.Position != 2 || s.MergeQueue.State != "AWAITING_CHECKS" || s.MergeQueue.EnqueuedAt == nil {
+		t.Fatalf("merge queue: %+v", s.MergeQueue)
+	}
+	for _, r := range s.Reasons {
+		if r == "ready_auto_merge_off" {
+			t.Fatal("a queued PR must not be reported as needing auto-merge")
+		}
+	}
+	q, _ := PollQuery([]Target{{NodeID: "PR_1"}})
+	if !strings.Contains(q, "mergeQueueEntry { position state enqueuedAt }") {
+		t.Fatalf("query:\n%s", q)
 	}
 }
 

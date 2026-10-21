@@ -28,6 +28,7 @@ var prFragment = `fragment PRF on PullRequest {
   mergeCommit { oid }
   headRefOid baseRefName mergeable mergeStateStatus
   autoMergeRequest { enabledAt mergeMethod }
+  mergeQueueEntry { position state enqueuedAt }
   reviewDecision updatedAt lastEditedAt
   repository { nameWithOwner }
   latestReviews(first: 20) { nodes { author { login } state submittedAt lastEditedAt commit { oid } } }
@@ -407,23 +408,24 @@ type OID struct {
 // RawPR mirrors the PRF fragment plus the rollup selection. It is exported
 // so the test fake can produce responses of the same shape.
 type RawPR struct {
-	ID               string        `json:"id"`
-	Number           int           `json:"number"`
-	URL              string        `json:"url"`
-	Title            string        `json:"title"`
-	State            string        `json:"state"`
-	IsDraft          bool          `json:"isDraft"`
-	Merged           bool          `json:"merged"`
-	MergedAt         *time.Time    `json:"mergedAt"`
-	MergeCommit      *OID          `json:"mergeCommit"`
-	HeadRefOid       string        `json:"headRefOid"`
-	BaseRefName      string        `json:"baseRefName"`
-	Mergeable        string        `json:"mergeable"`
-	MergeStateStatus string        `json:"mergeStateStatus"`
-	AutoMergeRequest *RawAutoMerge `json:"autoMergeRequest"`
-	ReviewDecision   *string       `json:"reviewDecision"`
-	UpdatedAt        time.Time     `json:"updatedAt"`
-	LastEditedAt     *time.Time    `json:"lastEditedAt"`
+	ID               string         `json:"id"`
+	Number           int            `json:"number"`
+	URL              string         `json:"url"`
+	Title            string         `json:"title"`
+	State            string         `json:"state"`
+	IsDraft          bool           `json:"isDraft"`
+	Merged           bool           `json:"merged"`
+	MergedAt         *time.Time     `json:"mergedAt"`
+	MergeCommit      *OID           `json:"mergeCommit"`
+	HeadRefOid       string         `json:"headRefOid"`
+	BaseRefName      string         `json:"baseRefName"`
+	Mergeable        string         `json:"mergeable"`
+	MergeStateStatus string         `json:"mergeStateStatus"`
+	AutoMergeRequest *RawAutoMerge  `json:"autoMergeRequest"`
+	MergeQueueEntry  *RawQueueEntry `json:"mergeQueueEntry"`
+	ReviewDecision   *string        `json:"reviewDecision"`
+	UpdatedAt        time.Time      `json:"updatedAt"`
+	LastEditedAt     *time.Time     `json:"lastEditedAt"`
 	Repository       struct {
 		NameWithOwner string `json:"nameWithOwner"`
 	} `json:"repository"`
@@ -456,6 +458,13 @@ type RawPR struct {
 type RawAutoMerge struct {
 	EnabledAt   *time.Time `json:"enabledAt"`
 	MergeMethod string     `json:"mergeMethod"`
+}
+
+// RawQueueEntry is a mergeQueueEntry.
+type RawQueueEntry struct {
+	Position   int        `json:"position"`
+	State      string     `json:"state"`
+	EnqueuedAt *time.Time `json:"enqueuedAt"`
 }
 
 // RawReviewRequest is a reviewRequests node.
@@ -584,6 +593,9 @@ func ToSnapshot(p *RawPR, ref prref.Ref, now time.Time) *snapshot.Snapshot {
 			m := p.AutoMergeRequest.MergeMethod
 			s.AutoMerge.Method = &m
 		}
+	}
+	if q := p.MergeQueueEntry; q != nil {
+		s.MergeQueue = &snapshot.MergeQueue{Position: q.Position, State: q.State, EnqueuedAt: q.EnqueuedAt}
 	}
 	for _, r := range p.LatestReviews.Nodes {
 		rv := snapshot.Review{Author: r.Author.name(), State: r.State, SubmittedAt: r.SubmittedAt, EditedAt: r.LastEditedAt}

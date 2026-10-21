@@ -88,6 +88,10 @@ func TestReasons(t *testing.T) {
 	}{
 		{"ready without auto-merge", func(s *Snapshot) {}, []string{ReasonReadyAutoMergeOff}},
 		{"ready with auto-merge", func(s *Snapshot) { s.AutoMerge.Enabled = true }, []string{}},
+		// A merge queue enqueues a PR without an auto-merge request.
+		{"ready and in the merge queue", func(s *Snapshot) {
+			s.MergeQueue = &MergeQueue{Position: 1, State: "AWAITING_CHECKS"}
+		}, []string{}},
 		{"required check failed", func(s *Snapshot) {
 			s.Checks.State = "FAILURE"
 			s.Checks.Contexts[0].Conclusion = "FAILURE"
@@ -221,6 +225,33 @@ func TestChanges(t *testing.T) {
 	}
 	if got := Changes(nil, b); !reflect.DeepEqual(got, []string{"initial"}) {
 		t.Fatalf("initial: %v", got)
+	}
+}
+
+func TestMergeQueueIsMaterialExceptPosition(t *testing.T) {
+	a := base()
+	queued := mod(a, func(s *Snapshot) { s.MergeQueue = &MergeQueue{Position: 2, State: "QUEUED"} })
+	if queued.Token == a.Token {
+		t.Fatal("joining the queue must change the token")
+	}
+	if got := Changes(a, queued); !reflect.DeepEqual(got, []string{"merge queue #2 queued"}) {
+		t.Fatalf("Changes = %v", got)
+	}
+	moved := mod(queued, func(s *Snapshot) { s.MergeQueue = &MergeQueue{Position: 1, State: "QUEUED"} })
+	if moved.Token != queued.Token {
+		t.Fatal("moving up the queue must not change the token")
+	}
+	checking := mod(moved, func(s *Snapshot) { s.MergeQueue = &MergeQueue{Position: 1, State: "AWAITING_CHECKS"} })
+	if checking.Token == moved.Token {
+		t.Fatal("a queue state change must change the token")
+	}
+	left := mod(checking, func(s *Snapshot) { s.MergeQueue = nil })
+	if got := Changes(checking, left); !reflect.DeepEqual(got, []string{"merge queue no"}) {
+		t.Fatalf("Changes = %v", got)
+	}
+	// Out of the queue and not merged: it needs action again.
+	if !reflect.DeepEqual(left.Reasons, []string{ReasonReadyAutoMergeOff}) {
+		t.Fatalf("reasons after leaving the queue: %v", left.Reasons)
 	}
 }
 
